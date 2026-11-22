@@ -30,6 +30,7 @@ pub(all) struct Config {
   web_host : String
   web_port : Int32
   system_prompt : String
+  intercept : Bool
 }
 
 // Type aliases

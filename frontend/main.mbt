@@ -25,6 +25,7 @@ struct Model {
   filter : String
   paused : Bool
   offline : Bool
+  intercept_enabled : Bool
 }
 
 ///|
@@ -38,6 +39,8 @@ enum Msg {
   TogglePause
   Clear
   Cleared
+  ToggleIntercept
+  InterceptToggled
 }
 
 ///|
@@ -54,6 +57,7 @@ fn initial_model() -> Model {
     filter: "",
     paused: false,
     offline: false,
+    intercept_enabled: true,
   }
 }
 
@@ -85,6 +89,7 @@ fn update(
         injected_total: resp.injected_total,
         stored: resp.stored,
         capacity: resp.capacity,
+        intercept_enabled: resp.intercept_enabled,
         offline: false,
       }
       match m.selected {
@@ -127,6 +132,16 @@ fn update(
       (model, @rhttp.delete("/api/flows").expect_empty(_ => emit(Cleared)))
     Cleared =>
       ({ ..model, flows: [], selected: None, detail: None, }, fetch_flows(emit))
+    ToggleIntercept => {
+      let next : @shared.InterceptState = { enabled: !model.intercept_enabled, }
+      (
+        model,
+        @rhttp.put("/api/intercept")
+        .with_json(next)
+        .expect_empty(_ => emit(InterceptToggled)),
+      )
+    }
+    InterceptToggled => (model, fetch_flows(emit))
   }
 }
 

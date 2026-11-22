@@ -54,6 +54,7 @@ pub struct FlowStore {
   mut next_id : Int32
   mut total : Int32
   mut injected_total : Int32
+  mut intercept_enabled : Bool
 }
 
 ///|
@@ -140,6 +141,23 @@ pub fn FlowStore::data_dir(self : FlowStore) -> String {
 }
 
 ///|
+/// Live interception switch: when false the proxy forwards everything
+/// unchanged (pure pass-through), ignoring the Chat Completions rule.
+pub fn FlowStore::intercept_enabled(self : FlowStore) -> Bool {
+  self.intercept_enabled
+}
+
+///|
+/// Flip the interception switch at runtime (monitor UI / API). Initial value
+/// comes from config; not persisted across restarts.
+pub fn FlowStore::set_intercept_enabled(
+  self : FlowStore,
+  enabled : Bool,
+) -> Unit {
+  self.intercept_enabled = enabled
+}
+
+///|
 /// Open a SQLite database at `path` (or `:memory:`) and prepare the schema.
 /// Returns `None` when the database cannot be opened/initialised, so callers
 /// can fall back to an in-memory store instead of taking the proxy down.
@@ -158,6 +176,7 @@ fn open_store(path : String, dir : String, capacity : Int32) -> FlowStore? {
     next_id: 1,
     total: 0,
     injected_total: 0,
+    intercept_enabled: true,
   }
   if !store.init_schema() {
     store.db.close()
@@ -630,6 +649,7 @@ pub fn FlowStore::list_response(self : FlowStore) -> @shared.FlowsResponse {
     injected_total: self.injected_total,
     stored: flows.length(),
     capacity: self.capacity,
+    intercept_enabled: self.intercept_enabled,
     flows,
   }
 }

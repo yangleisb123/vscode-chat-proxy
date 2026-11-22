@@ -47,6 +47,29 @@ pub async fn run_web_server(
         store.clear()
         res.send_json(@json.Json::object({ "ok": @json.Json::boolean(true) }))
       })
+      ctx.add_route(@http.RequestMethod::Put, "/api/intercept", (req, res) => {
+        let body = req.body.json() catch {
+          _ => {
+            res.send_text("invalid JSON body", status=400)
+            return
+          }
+        }
+        let state : @shared.InterceptState = @json.from_json(body) catch {
+          _ => {
+            res.send_text("expected {\"enabled\":bool}", status=400)
+            return
+          }
+        }
+        store.set_intercept_enabled(state.enabled)
+        println(
+          "[monitor] intercept switched " +
+          (if state.enabled { "on" } else { "off" }),
+        )
+        let now : @shared.InterceptState = {
+          enabled: store.intercept_enabled(),
+        }
+        res.send_json(now.to_json())
+      })
     }),
   )
   defer app.close()

@@ -57,6 +57,7 @@ pub struct FlowStore {
   mut next_id : Int32
   mut total : Int32
   mut injected_total : Int32
+  mut intercept_enabled : Bool
 }
 pub fn FlowStore::begin(Self, client_addr~ : String, http_method~ : String, target~ : String, request_headers~ : Array[(String, String)], request_body~ : Bytes, intercepted~ : Bool, upstream~ : String) -> Flow
 pub fn FlowStore::clear(Self) -> Unit
@@ -65,9 +66,11 @@ pub fn FlowStore::data_dir(Self) -> String
 pub fn FlowStore::detail(Self, Int32) -> @shared.FlowDetail?
 pub fn FlowStore::find(Self, Int32) -> Flow?
 pub fn FlowStore::finish(Self, Flow) -> Unit
+pub fn FlowStore::intercept_enabled(Self) -> Bool
 pub fn FlowStore::list_response(Self) -> @shared.FlowsResponse
 pub fn FlowStore::new(capacity? : Int32) -> Self
 pub async fn FlowStore::open(String, capacity? : Int32) -> Self
+pub fn FlowStore::set_intercept_enabled(Self, Bool) -> Unit
 
 // Type aliases
 

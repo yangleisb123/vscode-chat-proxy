@@ -106,3 +106,17 @@ test "config: forward mode is default, upstream pins reverse" {
   )
   assert_true(back is Ok({ forward: true, .. }))
 }
+
+///|
+test "config: intercept switch default on, CLI and env toggle" {
+  assert_true(default_config().intercept)
+  let off = parse_config(["prog", "--no-intercept"], default_config())
+  assert_true(off is Ok({ intercept: false, .. }))
+  let on = parse_config(
+    ["prog", "--no-intercept", "--intercept", "on"],
+    default_config(),
+  )
+  assert_true(on is Ok({ intercept: true, .. }))
+  let off2 = parse_config(["prog", "--intercept", "off"], default_config())
+  assert_true(off2 is Ok({ intercept: false, .. }))
+}

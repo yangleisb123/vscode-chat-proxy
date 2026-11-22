@@ -167,3 +167,16 @@ async test "flow: sqlite persists to temp dir, reloads, evicts, marks stale and 
   store3.close()
   @fs.rmdir(dir, recursive=true, allow_missing=true)
 }
+
+///|
+test "monitor: intercept switch defaults on and toggles at runtime" {
+  let store = FlowStore::new()
+  assert_true(store.intercept_enabled())
+  assert_true(store.list_response().intercept_enabled)
+  store.set_intercept_enabled(false)
+  assert_true(!store.intercept_enabled())
+  assert_true(!store.list_response().intercept_enabled)
+  store.set_intercept_enabled(true)
+  assert_true(store.list_response().intercept_enabled)
+  store.close()
+}

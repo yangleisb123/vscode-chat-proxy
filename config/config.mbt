@@ -18,6 +18,9 @@ pub(all) struct Config {
   web_port : Int32
   /// Sentence forced to open the first `system` message.
   system_prompt : String
+  /// Initial value of the interception switch (runtime-toggleable in the
+  /// monitor UI). false = pure pass-through proxy.
+  intercept : Bool
 }
 
 ///|
@@ -37,6 +40,7 @@ pub fn default_config() -> Config {
     web_host: "127.0.0.1",
     web_port: 8788,
     system_prompt: default_system_prompt,
+    intercept: true,
   }
 }
 
@@ -84,6 +88,34 @@ fn parse_env_port(name : String, default : Int32) -> Int32 {
       }
     }
     None => default
+  }
+}
+
+///|
+/// Parse an on/off environment variable (`1/0/true/false/on/off/yes/no`),
+/// falling back to `default` when missing or unrecognised.
+fn parse_env_bool(name : String, default : Bool) -> Bool {
+  match @env.get_env_var(name) {
+    Some(s) => parse_bool_value(s.clamped_view().trim(), default)
+    None => default
+  }
+}
+
+///|
+/// Interpret a boolean CLI/env token; unrecognised values keep `default`.
+fn parse_bool_value(v : StringView, default : Bool) -> Bool {
+  if v.equal_ignore_ascii_case("1") ||
+    v.equal_ignore_ascii_case("true") ||
+    v.equal_ignore_ascii_case("on") ||
+    v.equal_ignore_ascii_case("yes") {
+    true
+  } else if v.equal_ignore_ascii_case("0") ||
+    v.equal_ignore_ascii_case("false") ||
+    v.equal_ignore_ascii_case("off") ||
+    v.equal_ignore_ascii_case("no") {
+    false
+  } else {
+    default
   }
 }
 
@@ -138,6 +170,13 @@ pub fn config_from_env() -> Config {
   }
   cfg = { ..cfg, web_port: parse_env_port("WEB_PORT", cfg.web_port), }
   cfg = { ..cfg, system_prompt: system_prompt_from_env(cfg.system_prompt), }
+  cfg = {
+    ..cfg,
+    intercept: parse_env_bool(
+      "INTERCEPT",
+      parse_env_bool("VSCODE_CHAT_PROXY_INTERCEPT", cfg.intercept),
+    ),
+  }
   cfg
 }
 
@@ -223,6 +262,11 @@ fn parse_config_exn(
       i += 1
       continue
     }
+    if v.equal_ignore_ascii_case("--no-intercept") {
+      cfg = { ..cfg, intercept: false, }
+      i += 1
+      continue
+    }
     let (name, inline) = match v.split_once("=") {
       Some((n, val)) => (n.to_owned(), Some(val.to_owned()))
       None => (arg, None)
@@ -258,6 +302,14 @@ fn parse_config_exn(
         match normalize_prompt(value) {
           Some(prompt) => cfg = { ..cfg, system_prompt: prompt, }
           None => raise ConfigError("empty value for " + name)
+        }
+      "--intercept" =>
+        cfg = {
+          ..cfg,
+          intercept: parse_bool_value(
+            value.clamped_view().trim(),
+            cfg.intercept,
+          ),
         }
       _ => raise ConfigError("unknown option: " + name)
     }

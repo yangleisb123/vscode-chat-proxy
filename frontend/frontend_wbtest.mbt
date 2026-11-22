@@ -48,6 +48,7 @@ test "frontend: flows loaded updates stats and keeps selection" {
     injected_total: 1,
     stored: 2,
     capacity: 200,
+    intercept_enabled: true,
     flows: [sample_summary(1, false), sample_summary(2, false)],
   }
   let (m2, _) = update(m1, FlowsLoaded(Ok(resp)), emit)
@@ -66,11 +67,33 @@ test "frontend: selection cleared when flow evicted" {
     injected_total: 0,
     stored: 1,
     capacity: 200,
+    intercept_enabled: false,
     flows: [sample_summary(1, false)],
   }
   let (m2, _) = update(m1, FlowsLoaded(Ok(resp)), emit)
   assert_true(m2.selected is None)
   assert_true(m2.detail is None)
+  assert_true(!m2.intercept_enabled)
+}
+
+///|
+test "frontend: intercept toggle flips model and issues PUT" {
+  let emit = noop_emit()
+  let m0 = initial_model()
+  assert_true(m0.intercept_enabled)
+  let (m1, _) = update(m0, ToggleIntercept, emit)
+  // Model unchanged until server confirms via the next flows poll.
+  assert_true(m1.intercept_enabled)
+  let resp : @shared.FlowsResponse = {
+    total: 0,
+    injected_total: 0,
+    stored: 0,
+    capacity: 200,
+    intercept_enabled: false,
+    flows: [],
+  }
+  let (m2, _) = update(m1, FlowsLoaded(Ok(resp)), emit)
+  assert_true(!m2.intercept_enabled)
 }
 
 ///|

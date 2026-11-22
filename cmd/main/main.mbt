@@ -34,6 +34,7 @@ async fn main {
   } else {
     @proxy.FlowStore::new()
   }
+  store.set_intercept_enabled(cfg.intercept)
   try
     @async.with_task_group() <| group => {
       // Monitor web UI (mitmweb style). Its failure must not kill the proxy.
@@ -74,6 +75,10 @@ async fn main {
         )
       }
       println("[proxy] system prompt: \"" + cfg.system_prompt + "\"")
+      println(
+        "[proxy] intercept: " +
+        (if cfg.intercept { "on" } else { "off (pass-through)" }),
+      )
       println("[proxy] intercepting POST */v1/chat/completions")
       server.run_forever((conn, peer) => {
         @proxy.handle_connection(conn, cfg, store, peer.to_string())
@@ -102,6 +107,9 @@ fn usage() -> String {
   "  -u, --upstream <host:port>  Pin a fixed upstream (reverse-proxy mode);\n" +
   "                              omit for forward mode (default)\n" +
   "  -f, --forward               Force forward mode even if .env pins an upstream\n" +
+  "      --intercept on|off      Initial interception switch (default on);\n" +
+  "                              also toggleable live in the monitor UI\n" +
+  "      --no-intercept          Start as pure pass-through (intercept off)\n" +
   "  -w, --web <host:port|off>   Monitor web UI address (default 127.0.0.1:8788)\n" +
   "      --no-web                Disable the monitor web UI\n" +
   "  -s, --system-prompt <text>  Sentence forced to open the system message\n" +

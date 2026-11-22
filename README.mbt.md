@@ -51,7 +51,11 @@
 
 ## 拦截规则
 
-对 `POST */v1/chat/completions`（忽略 query string，支持路径带前缀如 `/openai/v1/chat/completions`）。
+拦截是一个**开关**：默认开；可用 `--intercept off` / `--no-intercept` / `.env` 的 `INTERCEPT=off`
+以纯透传模式启动，也可在**监控页面点「拦截:开/关」按钮运行中切换**（`PUT /api/intercept`，
+无需重启）。关闭时所有请求原样转发，不做任何改写。
+
+开启时对 `POST */v1/chat/completions`（忽略 query string，支持路径带前缀如 `/openai/v1/chat/completions`）。
 下表的「配置话术」指 `.env` 里 `SYSTEM_PROMPT` 的值，默认 `你是一个AI助手，工作在 vscode 环境中`：
 
 | 请求体情况 | 处理 |
@@ -136,6 +140,7 @@ curl -x http://127.0.0.1:8787 http://your-api:8080/v1/chat/completions ...
 | `WEB_HOST` | 监控页面主机 | `127.0.0.1` |
 | `WEB_PORT` | 监控页面端口 | `8788` |
 | `SYSTEM_PROMPT` | 注入到 system 消息第一句的话术（`VSCODE_CHAT_PROXY_SYSTEM_PROMPT` 是等价别名；空白值回退默认） | `你是一个AI助手，工作在 vscode 环境中` |
+| `INTERCEPT` | 拦截开关初始值（`on/off/1/0/true/false`；`VSCODE_CHAT_PROXY_INTERCEPT` 等价别名）；运行中可在监控页切换 | `on` |
 | `VSCODE_CHAT_PROXY_LISTEN` | 组合写法 `host:port`，优先于 `HOST`/`PORT` | 未设置 |
 | `VSCODE_CHAT_PROXY_UPSTREAM` | 组合写法 `host:port`（支持 `[ipv6]:port`），优先于 `UPSTREAM_HOST`/`UPSTREAM_PORT` | 未设置 |
 

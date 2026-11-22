@@ -55,10 +55,18 @@ pub(all) struct FlowsResponse {
   injected_total : Int32
   stored : Int32
   capacity : Int32
+  intercept_enabled : Bool
   flows : Array[FlowSummary]
 }
 pub fn FlowsResponse::from_json(@json.Json, @json.DecodeContext) -> Self raise @json.JsonDecodeError
 pub fn FlowsResponse::to_json(Self) -> @json.Json
+
+#derive(Eq, @debug.Debug, @json.FromJson, @json.ToJson)
+pub(all) struct InterceptState {
+  enabled : Bool
+}
+pub fn InterceptState::from_json(@json.Json, @json.DecodeContext) -> Self raise @json.JsonDecodeError
+pub fn InterceptState::to_json(Self) -> @json.Json
 
 #derive(Eq, @debug.Debug, @json.FromJson, @json.ToJson)
 pub(all) struct RequestData {

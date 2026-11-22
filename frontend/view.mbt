@@ -88,6 +88,19 @@ fn view(model : Model, emit : @rabbita.Emit[Msg]) -> @html.Html {
         on_input=s => emit(Filter(s)),
       ),
       @html.button(
+        class=if model.intercept_enabled { "on" } else { "" },
+        on_click=emit(ToggleIntercept),
+        [
+          @html.text(
+            if model.intercept_enabled {
+              "拦截:开"
+            } else {
+              "拦截:关"
+            },
+          ),
+        ],
+      ),
+      @html.button(
         class=if model.paused { "on" } else { "" },
         on_click=emit(TogglePause),
         [@html.text(if model.paused { "继续" } else { "暂停" })],

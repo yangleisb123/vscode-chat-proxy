@@ -107,7 +107,8 @@ async fn handle_connection_inner(
     client.write("HTTP/1.1 100 Continue\r\n\r\n")
   }
   let body = read_request_body(client, head)
-  let intercepted = @httpparse.is_chat_completions(http_method, out_target)
+  let intercepted = store.intercept_enabled() &&
+    @httpparse.is_chat_completions(http_method, out_target)
   let upstream_addr = up_host + ":" + up_port.to_string()
   let flow = store.begin(
     client_addr~,

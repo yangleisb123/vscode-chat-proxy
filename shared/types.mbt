@@ -40,6 +40,12 @@ pub extend FlowDetail with ToJson::{to_json}
 pub extend FlowDetail with @json.FromJson::{from_json}
 
 ///|
+pub extend InterceptState with ToJson::{to_json}
+
+///|
+pub extend InterceptState with @json.FromJson::{from_json}
+
+///|
 /// One row of the flow list (`GET /api/flows`).
 #derive(Eq, Debug, ToJson, FromJson)
 pub(all) struct FlowSummary {
@@ -67,7 +73,16 @@ pub(all) struct FlowsResponse {
   injected_total : Int32
   stored : Int32
   capacity : Int32
+  /// Live interception switch (runtime-toggleable from the monitor UI).
+  intercept_enabled : Bool
   flows : Array[FlowSummary]
+}
+
+///|
+/// Body / response of `PUT /api/intercept`: the runtime interception switch.
+#derive(Eq, Debug, ToJson, FromJson)
+pub(all) struct InterceptState {
+  enabled : Bool
 }
 
 ///|
