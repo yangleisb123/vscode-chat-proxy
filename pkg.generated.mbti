@@ -1,5 +1,5 @@
 // Generated using `moon info`, DON'T EDIT IT
-package "username/vscode-chat-proxy"
+package "1123Javayanglei/vscode-chat-proxy"
 
 import {
   "moonbitlang/async/socket",

@@ -9,17 +9,17 @@
 //   "moonbitlang/x@0.4.6",
 // }
 
-name = "username/vscode-chat-proxy"
+name = "1123Javayanglei/vscode-chat-proxy"
 
 version = "0.1.0"
 
 readme = "README.mbt.md"
 
-repository = ""
+repository = "https://github.com/1123Javayanglei/vscode-chat-proxy"
 
 license = "Apache-2.0"
 
-keywords = [ ]
+keywords = [ "openai", "proxy", "chat-completions", "vscode" ]
 
 preferred_target = "wasm"
 

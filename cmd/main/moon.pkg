@@ -1,5 +1,5 @@
 import {
-  "username/vscode-chat-proxy" @proxy,
+  "1123Javayanglei/vscode-chat-proxy" @proxy,
   "moonbitlang/async/socket",
   "moonbitlang/core/env",
 }
