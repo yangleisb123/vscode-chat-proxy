@@ -22,6 +22,65 @@ pub fn default_config() -> Config {
 }
 
 ///|
+/// Parse an environment variable as a port number, falling back to `default`
+/// when missing, invalid or out of range.
+fn parse_env_port(name : String, default : Int32) -> Int32 {
+  match @env.get_env_var(name) {
+    Some(s) => {
+      let n = @string.parse_int(s.clamped_view().trim()) catch {
+        _ => return default
+      }
+      if n < 1 || n > 65535 {
+        default
+      } else {
+        n
+      }
+    }
+    None => default
+  }
+}
+
+///|
+/// Build the base config from environment variables (call after `load_env`).
+///
+/// Individual variables: `HOST`, `PORT`, `UPSTREAM_HOST`, `UPSTREAM_PORT`.
+/// Combined `host:port` variables `VSCODE_CHAT_PROXY_LISTEN` /
+/// `VSCODE_CHAT_PROXY_UPSTREAM` take precedence over the individual ones.
+pub fn config_from_env() -> Config {
+  let mut cfg = default_config()
+  match @env.get_env_var("HOST") {
+    Some(h) if !h.is_empty() => cfg = { ..cfg, listen_host: h, }
+    _ => ()
+  }
+  cfg = { ..cfg, listen_port: parse_env_port("PORT", cfg.listen_port), }
+  match @env.get_env_var("UPSTREAM_HOST") {
+    Some(h) if !h.is_empty() => cfg = { ..cfg, upstream_host: h, }
+    _ => ()
+  }
+  cfg = {
+    ..cfg,
+    upstream_port: parse_env_port("UPSTREAM_PORT", cfg.upstream_port),
+  }
+  match @env.get_env_var("VSCODE_CHAT_PROXY_LISTEN") {
+    Some(v) =>
+      match parse_address(v) {
+        Ok((h, p)) => cfg = { ..cfg, listen_host: h, listen_port: p, }
+        Err(_) => ()
+      }
+    None => ()
+  }
+  match @env.get_env_var("VSCODE_CHAT_PROXY_UPSTREAM") {
+    Some(v) =>
+      match parse_address(v) {
+        Ok((h, p)) => cfg = { ..cfg, upstream_host: h, upstream_port: p, }
+        Err(_) => ()
+      }
+    None => ()
+  }
+  cfg
+}
+
+///|
 /// Split `host:port` (also supports `[ipv6]:port`).
 fn split_host_port(s : String) -> (String, Int32) raise ConfigError {
   let v = s.clamped_view()

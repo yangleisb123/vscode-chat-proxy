@@ -34,13 +34,22 @@
 ```bash
 cd vscode-chat-proxy
 
-# 运行（默认 wasm 目标，Windows / Linux 都开箱即用）
+# 1. 创建用户配置（参考 moonbit_claude_proxy 的 .env 模式）
+cp .env.example .env        # Windows PowerShell: Copy-Item .env.example .env
+# 按需编辑 .env 里的 HOST / PORT / UPSTREAM_HOST / UPSTREAM_PORT
+
+# 2. 运行（默认 wasm 目标，Windows / Linux 都开箱即用，自动读取 .env）
+moon run cmd/main
+```
+
+也可以不用 `.env`，直接命令行指定：
+
+```bash
 moon run cmd/main -- --listen 127.0.0.1:8787 --upstream 127.0.0.1:8080
 ```
 
 - `--listen` / `-l`：本地监听地址，默认 `127.0.0.1:8787`
 - `--upstream` / `-u`：上游 HTTP API 服务器地址，默认 `127.0.0.1:8080`
-- 也支持环境变量 `VSCODE_CHAT_PROXY_LISTEN` / `VSCODE_CHAT_PROXY_UPSTREAM`（命令行优先）
 - `--help` 查看帮助
 
 然后把客户端（VSCode 插件、CLI 等）的 API Base URL 指向代理，例如：
@@ -49,6 +58,25 @@ moon run cmd/main -- --listen 127.0.0.1:8787 --upstream 127.0.0.1:8080
 原来: http://127.0.0.1:8080/v1
 现在: http://127.0.0.1:8787/v1
 ```
+
+## 用户配置（.env）
+
+启动时自动加载**工作目录**下的 `.env`（不存在则跳过），格式与 `moonbit_claude_proxy` 一致：
+`KEY=VALUE`、`#` 注释、空行、引号包裹的值、`export` 前缀、行内注释。
+**已存在的环境变量不会被 `.env` 覆盖。**
+
+**优先级：命令行参数 > 真实环境变量 > `.env` > 默认值**（已实测验证）。
+
+| 变量 | 说明 | 默认值 |
+|---|---|---|
+| `HOST` | 本地监听主机 | `127.0.0.1` |
+| `PORT` | 本地监听端口 | `8787` |
+| `UPSTREAM_HOST` | 上游 API 主机 | `127.0.0.1` |
+| `UPSTREAM_PORT` | 上游 API 端口（明文 HTTP） | `8080` |
+| `VSCODE_CHAT_PROXY_LISTEN` | 组合写法 `host:port`，优先于 `HOST`/`PORT` | 未设置 |
+| `VSCODE_CHAT_PROXY_UPSTREAM` | 组合写法 `host:port`（支持 `[ipv6]:port`），优先于 `UPSTREAM_HOST`/`UPSTREAM_PORT` | 未设置 |
+
+`.env` 已加入 `.gitignore`（不会提交），模板见 [.env.example](.env.example)。
 
 ### 示例
 
@@ -78,11 +106,13 @@ moon build --target native --release
   由工具链自带的 `moonrun` 运行，功能完全一致，已在 Windows 11 实测通过。
 - wasm 目标产物在 `_build/wasm/release/build/cmd/main/main.wasm`，
   可用 `moon run cmd/main --target wasm --release -- <参数>` 运行。
+- **部署**：独立二进制 + 同目录 `.env` 即可运行（与 `moonbit_claude_proxy` 相同），
+  无需 MoonBit 工具链；`.env` 从**进程工作目录**读取。
 
 ## 测试
 
 ```bash
-moon test                 # 23 个单元测试（默认 wasm 目标）
+moon test                 # 34 个单元测试（默认 wasm 目标）
 moon test --target native # Linux / 有 MSVC 的 Windows
 
 # 端到端测试：先起一个 mock 上游（需要 Node.js）
@@ -93,7 +123,8 @@ moon run cmd/main -- -l 127.0.0.1:18787 -u 127.0.0.1:18080
 
 已验证场景（Windows wasm 与 Linux native 双平台）：
 无 system 插入、已有前缀放行、其他 system 文本前置注入、多模态 content、
-SSE 流式透传、chunked 请求体、GET/其他路径透传、`Authorization` 等头部保留。
+SSE 流式透传、chunked 请求体、GET/其他路径透传、`Authorization` 等头部保留、
+`.env` 加载与「命令行 > 环境变量 > .env」优先级。
 
 ## 项目结构
 
@@ -101,8 +132,10 @@ SSE 流式透传、chunked 请求体、GET/其他路径透传、`Authorization` 
 prefix.mbt        # 核心逻辑：system message 检查与注入（纯函数，可单测）
 http.mbt          # HTTP 请求行/头部解析、目标路径匹配、上游请求头重建
 proxy.mbt         # 异步连接处理：读请求 → 改写 → 转发 → 流式回传
-config.mbt        # 命令行/地址解析
-cmd/main/         # 入口：监听端口，run_forever 并发处理连接
+config.mbt        # 命令行/地址解析、环境变量配置（config_from_env）
+dotenv.mbt        # .env 文件加载（不覆盖已有环境变量）
+cmd/main/         # 入口：load_env → 配置 → 监听端口，run_forever 并发处理连接
+.env.example      # 用户配置模板（复制为 .env 使用）
 test/             # mock 上游（Node.js，端到端测试用）
 ```
 

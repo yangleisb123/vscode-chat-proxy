@@ -7,29 +7,10 @@ async fn main {
     println(usage())
     return
   }
-  let mut base = @proxy.default_config()
-  match @env.get_env_var("VSCODE_CHAT_PROXY_LISTEN") {
-    Some(v) =>
-      match @proxy.parse_address(v) {
-        Ok((h, p)) => base = { ..base, listen_host: h, listen_port: p, }
-        Err(msg) => {
-          println("[proxy] bad VSCODE_CHAT_PROXY_LISTEN: " + msg)
-          @env.exit(1)
-        }
-      }
-    None => ()
-  }
-  match @env.get_env_var("VSCODE_CHAT_PROXY_UPSTREAM") {
-    Some(v) =>
-      match @proxy.parse_address(v) {
-        Ok((h, p)) => base = { ..base, upstream_host: h, upstream_port: p, }
-        Err(msg) => {
-          println("[proxy] bad VSCODE_CHAT_PROXY_UPSTREAM: " + msg)
-          @env.exit(1)
-        }
-      }
-    None => ()
-  }
+  // Load `.env` (existing environment variables win), then build the base
+  // config from the environment; CLI flags override everything.
+  @proxy.load_env()
+  let base = @proxy.config_from_env()
   let cfg = match @proxy.parse_config(args, base) {
     Ok(cfg) => cfg
     Err(msg) => {
@@ -75,7 +56,12 @@ fn usage() -> String {
   "  -u, --upstream <host:port>  Upstream HTTP API server (default 127.0.0.1:8080)\n" +
   "  -h, --help                  Show this help\n" +
   "\n" +
-  "Environment variables (CLI flags take precedence):\n" +
-  "  VSCODE_CHAT_PROXY_LISTEN    Same as --listen\n" +
-  "  VSCODE_CHAT_PROXY_UPSTREAM  Same as --upstream\n"
+  "Configuration precedence: CLI flags > environment variables > .env > defaults.\n" +
+  "A `.env` file in the working directory is loaded automatically (see .env.example).\n" +
+  "\n" +
+  "Environment variables:\n" +
+  "  HOST / PORT                 Listen address (default 127.0.0.1 / 8787)\n" +
+  "  UPSTREAM_HOST / UPSTREAM_PORT  Upstream address (default 127.0.0.1 / 8080)\n" +
+  "  VSCODE_CHAT_PROXY_LISTEN    Combined host:port, overrides HOST/PORT\n" +
+  "  VSCODE_CHAT_PROXY_UPSTREAM  Combined host:port, overrides UPSTREAM_HOST/UPSTREAM_PORT\n"
 }

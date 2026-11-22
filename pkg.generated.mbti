@@ -7,11 +7,15 @@ import {
 }
 
 // Values
+pub fn config_from_env() -> Config
+
 pub fn default_config() -> Config
 
 pub fn ensure_system_prefix(@json.Json) -> Bool
 
 pub async fn handle_connection(@socket.Tcp, Config) -> Unit
+
+pub async fn load_env(path? : String) -> Unit
 
 pub fn parse_address(String) -> Result[(String, Int32), String]
 
