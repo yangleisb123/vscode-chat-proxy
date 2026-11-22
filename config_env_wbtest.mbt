@@ -45,3 +45,14 @@ test "config: invalid env values fall back to defaults" {
   assert_eq(cfg.upstream_port, 8080)
   assert_eq(cfg.listen_host, "127.0.0.1")
 }
+
+///|
+test "config: web env vars" {
+  @env.set_env_var("WEB_HOST", "0.0.0.0")
+  @env.set_env_var("WEB_PORT", "9090")
+  defer @env.unset_env_var("WEB_HOST")
+  defer @env.unset_env_var("WEB_PORT")
+  let cfg = config_from_env()
+  assert_eq(cfg.web_host, "0.0.0.0")
+  assert_eq(cfg.web_port, 9090)
+}

@@ -4,6 +4,9 @@ pub(all) struct Config {
   listen_port : Int32
   upstream_host : String
   upstream_port : Int32
+  web_enabled : Bool
+  web_host : String
+  web_port : Int32
 }
 
 ///|
@@ -18,6 +21,9 @@ pub fn default_config() -> Config {
     listen_port: 8787,
     upstream_host: "127.0.0.1",
     upstream_port: 8080,
+    web_enabled: true,
+    web_host: "127.0.0.1",
+    web_port: 8788,
   }
 }
 
@@ -77,6 +83,11 @@ pub fn config_from_env() -> Config {
       }
     None => ()
   }
+  match @env.get_env_var("WEB_HOST") {
+    Some(h) if !h.is_empty() => cfg = { ..cfg, web_host: h, }
+    _ => ()
+  }
+  cfg = { ..cfg, web_port: parse_env_port("WEB_PORT", cfg.web_port), }
   cfg
 }
 
@@ -152,6 +163,11 @@ fn parse_config_exn(
       i += 1
       continue
     }
+    if v.equal_ignore_ascii_case("--no-web") {
+      cfg = { ..cfg, web_enabled: false, }
+      i += 1
+      continue
+    }
     let (name, inline) = match v.split_once("=") {
       Some((n, val)) => (n.to_owned(), Some(val.to_owned()))
       None => (arg, None)
@@ -175,6 +191,14 @@ fn parse_config_exn(
         let (h, p) = split_host_port(value)
         cfg = { ..cfg, upstream_host: h, upstream_port: p, }
       }
+      "--web" | "-w" =>
+        if value.clamped_view().equal_ignore_ascii_case("off") ||
+          value.clamped_view().equal_ignore_ascii_case("none") {
+          cfg = { ..cfg, web_enabled: false, }
+        } else {
+          let (h, p) = split_host_port(value)
+          cfg = { ..cfg, web_enabled: true, web_host: h, web_port: p, }
+        }
       _ => raise ConfigError("unknown option: " + name)
     }
     i += 1

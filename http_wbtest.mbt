@@ -79,6 +79,18 @@ test "http: build_upstream_head rewrites hop-by-hop headers" {
 }
 
 ///|
+test "http: parse_status_line" {
+  assert_eq(parse_status_line("HTTP/1.1 200 OK"), Some((200, "OK")))
+  assert_eq(
+    parse_status_line("HTTP/1.0 404 Not Found"),
+    Some((404, "Not Found")),
+  )
+  assert_eq(parse_status_line("HTTP/1.1 204"), Some((204, "")))
+  assert_true(parse_status_line("garbage") is None)
+  assert_true(parse_status_line("HTTP/1.1 abc OK") is None)
+}
+
+///|
 test "http: build_upstream_head omits port 80 and content-length when asked" {
   let head : RequestHead = {
     http_method: "GET",

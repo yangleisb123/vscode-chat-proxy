@@ -11,15 +11,26 @@ pub(all) suberror ProxyError {
 /// Handle one client connection: read one HTTP request, optionally rewrite
 /// the Chat Completions system message, forward it to the upstream and
 /// stream the response back (SSE works). The connection is closed
-/// afterwards (`Connection: close`).
-pub async fn handle_connection(client : @socket.Tcp, cfg : Config) -> Unit {
-  handle_connection_inner(client, cfg) catch {
+/// afterwards (`Connection: close`). Every proxied request is recorded
+/// in the flow store for the monitor UI.
+pub async fn handle_connection(
+  client : @socket.Tcp,
+  cfg : Config,
+  store : FlowStore,
+  client_addr : String,
+) -> Unit {
+  handle_connection_inner(client, cfg, store, client_addr) catch {
     e => println("[proxy] connection error: " + e.to_string())
   }
 }
 
 ///|
-async fn handle_connection_inner(client : @socket.Tcp, cfg : Config) -> Unit {
+async fn handle_connection_inner(
+  client : @socket.Tcp,
+  cfg : Config,
+  store : FlowStore,
+  client_addr : String,
+) -> Unit {
   let line = match client.read_until("\r\n") {
     Some(l) if !l.is_empty() => l
     _ => return // client closed without sending anything
@@ -57,13 +68,35 @@ async fn handle_connection_inner(client : @socket.Tcp, cfg : Config) -> Unit {
     client.write("HTTP/1.1 100 Continue\r\n\r\n")
   }
   let body = read_request_body(client, head)
+  let intercepted = is_chat_completions(http_method, target)
+  let upstream_addr = cfg.upstream_host + ":" + cfg.upstream_port.to_string()
+  let flow = store.begin(
+    client_addr~,
+    http_method~,
+    target~,
+    request_headers=headers,
+    request_body=body,
+    intercepted~,
+    upstream=upstream_addr,
+  )
+  // Finalize the flow even if the connection aborts mid-way.
+  errdefer (if !flow.finished {
+    if flow.error is None {
+      flow.error = Some("connection aborted")
+    }
+    store.finish(flow)
+  })
   let mut out_body = body
-  if is_chat_completions(http_method, target) {
+  if intercepted {
     if body.length() > 0 {
       try {
         let json = @json.parse(@utf8.decode(body))
         if ensure_system_prefix(json) {
           out_body = @utf8.encode(json.stringify())
+          flow.injected = true
+          let (capped, truncated) = cap_bytes(out_body)
+          flow.upstream_body = Some(capped)
+          flow.upstream_truncated = truncated
           println(
             "[proxy] " +
             http_method +
@@ -100,7 +133,13 @@ async fn handle_connection_inner(client : @socket.Tcp, cfg : Config) -> Unit {
   ) catch {
     e => {
       println("[proxy] upstream connect failed: " + e.to_string())
+      flow.error = Some("upstream connect failed: " + e.to_string())
+      flow.status = 502
+      flow.reason = "Bad Gateway"
+      flow.response_body = @utf8.encode("proxy error: Bad Gateway\n")
+      flow.response_size = flow.response_body.length()
       send_simple(client, 502, "Bad Gateway")
+      store.finish(flow)
       return
     }
   }
@@ -120,14 +159,79 @@ async fn handle_connection_inner(client : @socket.Tcp, cfg : Config) -> Unit {
   if out_body.length() > 0 {
     upstream.write(out_body)
   }
-  // Stream the response back as it arrives (works for SSE / chunked).
-  // Upstream was told `Connection: close`, so EOF marks the end.
+  // Read the response head for the monitor, forward it verbatim to the
+  // client, then stream the body back as it arrives (SSE / chunked),
+  // capturing a capped copy for the monitor.
+  let status_line = match upstream.read_until("\r\n") {
+    Some(l) => l
+    None => {
+      flow.error = Some("upstream closed without response")
+      store.finish(flow)
+      return
+    }
+  }
+  match parse_status_line(status_line) {
+    Some((code, reason)) => {
+      flow.status = code
+      flow.reason = reason
+    }
+    None => flow.error = Some("bad status line: " + status_line)
+  }
+  let resp_headers : Array[(String, String)] = []
+  let mut head_raw = status_line + "\r\n"
   for ;; {
-    match upstream.read_some(max_len=65536) {
-      Some(chunk) => client.write(chunk)
+    match upstream.read_until("\r\n") {
+      Some("") => {
+        head_raw = head_raw + "\r\n"
+        break
+      }
+      Some(l) => {
+        head_raw = head_raw + l + "\r\n"
+        match parse_header_line(l) {
+          Some(h) => resp_headers.push(h)
+          None => ()
+        }
+      }
       None => break
     }
   }
+  flow.response_headers = resp_headers
+  client.write(head_raw)
+  let resp_chunked = match find_header(resp_headers, "transfer-encoding") {
+    Some(v) => v.clamped_view().to_lower().contains("chunked")
+    None => false
+  }
+  let buf = @buffer.Buffer()
+  let mut resp_size = 0
+  for ;; {
+    match upstream.read_some(max_len=65536) {
+      Some(chunk) => {
+        client.write(chunk)
+        resp_size += chunk.length()
+        if buf.length() < body_capture_limit {
+          let room = body_capture_limit - buf.length()
+          let take = if chunk.length() < room { chunk.length() } else { room }
+          buf.write_bytes(chunk.clamped_view(end=take))
+        }
+      }
+      None => break
+    }
+  }
+  let raw = buf.to_bytes()
+  flow.response_body = if resp_chunked { decode_chunked_body(raw) } else { raw }
+  flow.response_size = resp_size
+  flow.response_truncated = resp_size > body_capture_limit
+  store.finish(flow)
+}
+
+///|
+fn find_header(headers : Array[(String, String)], name : String) -> String? {
+  for pair in headers {
+    if pair.0.clamped_view().equal_ignore_ascii_case(name) {
+      return Some(pair.1)
+    }
+  }
+  None
 }
 
 ///|

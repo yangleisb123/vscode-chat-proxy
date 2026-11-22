@@ -26,6 +26,22 @@ fn parse_request_line(line : String) -> (String, String, String)? {
 }
 
 ///|
+/// Parse a response status line like `HTTP/1.1 200 OK`.
+fn parse_status_line(line : String) -> (Int32, String)? {
+  match line.clamped_view().split_once(" ") {
+    Some((version, rest)) if version.has_prefix("HTTP/") => {
+      let (code_str, reason) = match rest.split_once(" ") {
+        Some((c, r)) => (c, r.to_owned())
+        None => (rest, "")
+      }
+      let code = @string.parse_int(code_str) catch { _ => return None }
+      Some((code, reason))
+    }
+    _ => None
+  }
+}
+
+///|
 /// Parse a header line like `Content-Type: application/json`.
 fn parse_header_line(line : String) -> (String, String)? {
   match line.clamped_view().split_once(":") {

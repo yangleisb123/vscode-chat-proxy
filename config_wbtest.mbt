@@ -48,3 +48,18 @@ test "config: wants_help" {
   assert_true(wants_help(["prog", "-h"]))
   assert_true(!wants_help(["prog", "--listen", "127.0.0.1:1"]))
 }
+
+///|
+test "config: web options" {
+  let cfg = parse_config(["prog", "--web", "0.0.0.0:9999"], default_config()).unwrap()
+  assert_true(cfg.web_enabled)
+  assert_eq(cfg.web_host, "0.0.0.0")
+  assert_eq(cfg.web_port, 9999)
+  let cfg2 = parse_config(["prog", "--no-web"], default_config()).unwrap()
+  assert_true(!cfg2.web_enabled)
+  let cfg3 = parse_config(["prog", "-w", "off"], default_config()).unwrap()
+  assert_true(!cfg3.web_enabled)
+  let cfg4 = parse_config(["prog"], default_config()).unwrap()
+  assert_true(cfg4.web_enabled)
+  assert_eq(cfg4.web_port, 8788)
+}

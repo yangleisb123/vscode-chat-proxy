@@ -9,3 +9,6 @@ target
 
 # Keep the config template in the published package (dotfiles are excluded by default)
 !/.env.example
+
+# Screenshots are for the GitHub README only
+test/*.png
