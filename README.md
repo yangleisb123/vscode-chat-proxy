@@ -1,6 +1,7 @@
 # vscode-chat-proxy
 
-一个用 **MoonBit** 编写的本地 HTTP 反向代理：监听本地端口，把请求转发给上游 API 服务器，
+一个用 **MoonBit** 编写的本地 HTTP **正向代理（mitmproxy 用法）**：监听本地端口，
+把应用的 HTTP 代理指向它，请求按**自带目标地址**转发到原服务器（无需配置上游），
 并拦截所有 **URL 以 `/v1/chat/completions` 结尾的 POST 请求**（标准 Chat Completions API），
 确保其 System message 的第一句是**配置里指定的话术**——默认是：
 
@@ -33,6 +34,21 @@
 自研部分只保留生态里没有的：代理数据面（TCP 级转发 + system 前缀注入）、
 流量捕获 SQLite 存储、以及把前端产物内嵌进单二进制的构建脚本。
 
+## 工作模式：正向代理（默认）与反向代理
+
+**正向代理（mitmproxy 用法，默认）**：不配置上游。把应用/系统的 HTTP 代理设为
+`http://127.0.0.1:8787`，代理从每个请求自身解析目标地址并转发：
+
+- `POST http://host:port/v1/... HTTP/1.1`（absolute-form，`curl -x` / 多数 HTTP 客户端代理模式）→ 按 URL 里的 host:port 转发；
+- `GET /v1/... HTTP/1.1` + `Host: host:port`（origin-form）→ 按 `Host` 头转发；
+- `CONNECT host:443 HTTP/1.1`（HTTPS）→ 建立**盲隧道**双向透传字节。TLS 端到端加密，
+  **不做 MITM，故 HTTPS 的 body 无法检查/改写**；监控只记录该连接与上下行字节数。
+  如需改写 HTTPS 请求，请让客户端走明文 HTTP 到代理，或改用反向代理模式指向明文上游。
+
+**反向代理（可选）**：加 `--upstream host:port`（或 `.env` 的 `UPSTREAM_HOST/PORT`）后，
+所有请求固定转发到该上游（忽略请求自带目标），即旧版行为；客户端把 API Base URL 指向代理即可。
+`.env` 已固定上游时可用 `--forward` 强制回到正向模式。
+
 ## 拦截规则
 
 对 `POST */v1/chat/completions`（忽略 query string，支持路径带前缀如 `/openai/v1/chat/completions`）。
@@ -51,8 +67,9 @@
 
 其他请求（GET、其他路径、其他方法）**全部原样透传**，不做任何修改。
 
-转发时会自动：重写 `Host` 为上游地址、按改写后的_body_重算 `Content-Length`、
+转发时会自动：正向模式保留原 `Host`、反向模式重写 `Host` 为上游地址；按改写后的_body_重算 `Content-Length`、
 支持 `Transfer-Encoding: chunked` 请求体解码、处理 `Expect: 100-continue`、
+丢弃 hop-by-hop 头（含 `Proxy-Connection`/`Proxy-Authorization`）、
 强制 `Connection: close`（每个连接处理一个请求，客户端会自动重连，不影响使用）。
 
 ## 快速开始
@@ -74,16 +91,28 @@ moon run cmd/main
 也可以不用 `.env`，直接命令行指定：
 
 ```bash
+# 正向代理（默认，无需上游）：把应用 HTTP 代理指向 127.0.0.1:8787
+moon run cmd/main -- --listen 127.0.0.1:8787
+
+# 反向代理（固定上游）：
 moon run cmd/main -- --listen 127.0.0.1:8787 --upstream 127.0.0.1:8080
 ```
 
 - `--listen` / `-l`：本地监听地址，默认 `127.0.0.1:8787`
-- `--upstream` / `-u`：上游 HTTP API 服务器地址，默认 `127.0.0.1:8080`
+- `--upstream` / `-u`：固定上游（反向代理模式）；**省略则为正向代理（默认）**
+- `--forward` / `-f`：强制正向模式（覆盖 `.env` 里固定的上游）
 - `--web` / `-w`：监控页面地址，默认 `127.0.0.1:8788`（`--web off` 或 `--no-web` 关闭）
 - `--system-prompt` / `-s`（别名 `--prompt`）：注入的 system 第一句，默认 `你是一个AI助手，工作在 vscode 环境中`
 - `--help` 查看帮助
 
-然后把客户端（VSCode 插件、CLI 等）的 API Base URL 指向代理，例如：
+**正向模式**下把客户端的 HTTP 代理指向代理，例如：
+
+```bash
+curl -x http://127.0.0.1:8787 http://your-api:8080/v1/chat/completions ...
+# 或环境变量 HTTP_PROXY=http://127.0.0.1:8787 / VSCode 的 http.proxy 设置
+```
+
+**反向模式**下把客户端的 API Base URL 指向代理，例如：
 
 ```
 原来: http://127.0.0.1:8080/v1
@@ -102,8 +131,8 @@ moon run cmd/main -- --listen 127.0.0.1:8787 --upstream 127.0.0.1:8080
 |---|---|---|
 | `HOST` | 本地监听主机 | `127.0.0.1` |
 | `PORT` | 本地监听端口 | `8787` |
-| `UPSTREAM_HOST` | 上游 API 主机 | `127.0.0.1` |
-| `UPSTREAM_PORT` | 上游 API 端口（明文 HTTP） | `8080` |
+| `UPSTREAM_HOST` | 固定上游主机（**设置即切换反向模式**；不设=正向） | 未设置 |
+| `UPSTREAM_PORT` | 固定上游端口（明文 HTTP） | 未设置 |
 | `WEB_HOST` | 监控页面主机 | `127.0.0.1` |
 | `WEB_PORT` | 监控页面端口 | `8788` |
 | `SYSTEM_PROMPT` | 注入到 system 消息第一句的话术（`VSCODE_CHAT_PROXY_SYSTEM_PROMPT` 是等价别名；空白值回退默认） | `你是一个AI助手，工作在 vscode 环境中` |
@@ -190,8 +219,17 @@ moon build --target native --release
 ```
 
 - **Linux**：native 目标需要 gcc / clang（发行版自带即可），已在 OpenCloudOS 9 + gcc 12 实测通过。
-- **Windows**：native 目标需要 **MSVC**（VS Build Tools 的「使用 C++ 的桌面开发」
-  工作负载，含 Windows SDK；MinGW 不支持）。SQLite 已随程序静态编译，不需要额外安装。
+- **Windows**：native 目标需要 **MSVC**（VS Build Tools 的「使用 C++ 的桌面开发」工作负载，
+  含 Windows SDK；MinGW 不支持）。安装（管理员 PowerShell，约 10–30 分钟）：
+
+  ```powershell
+  # 下载引导器后执行（会弹 UAC）：
+  .\vs_buildtools.exe --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended --quiet --wait --norestart
+  ```
+
+  装好后 `moon build --target native --release` 直接产出 Windows exe，
+  已在 Windows 11 + MSVC v143 实测通过。moon 会自动探测 MSVC 环境，无需手动配置。
+  SQLite 已随程序静态编译，不需要额外安装。
 - 后端只支持 **native**（监控存储使用嵌入式 SQLite）；前端仍是 MoonBit JS，构建时内嵌。
   不再提供 wasm 后端产物。
 - **部署**：独立二进制 + 同目录 `.env` 即可运行（与 `moonbit_claude_proxy` 相同），

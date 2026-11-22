@@ -9,6 +9,10 @@ pub(all) struct Config {
   listen_port : Int32
   upstream_host : String
   upstream_port : Int32
+  /// true = forward proxy (mitmproxy-style): destination derived from each
+  /// request (absolute-form URL / Host header / CONNECT authority).
+  /// false = reverse proxy pinned to upstream_host:upstream_port.
+  forward : Bool
   web_enabled : Bool
   web_host : String
   web_port : Int32
@@ -28,6 +32,7 @@ pub fn default_config() -> Config {
     listen_port: 8787,
     upstream_host: "127.0.0.1",
     upstream_port: 8080,
+    forward: true,
     web_enabled: true,
     web_host: "127.0.0.1",
     web_port: 8788,
@@ -98,8 +103,13 @@ pub fn config_from_env() -> Config {
   }
   cfg = { ..cfg, listen_port: parse_env_port("PORT", cfg.listen_port), }
   match @env.get_env_var("UPSTREAM_HOST") {
-    Some(h) if !h.is_empty() => cfg = { ..cfg, upstream_host: h, }
+    Some(h) if !h.is_empty() =>
+      cfg = { ..cfg, upstream_host: h, forward: false, }
     _ => ()
+  }
+  match @env.get_env_var("UPSTREAM_PORT") {
+    Some(_) => cfg = { ..cfg, forward: false, }
+    None => ()
   }
   cfg = {
     ..cfg,
@@ -116,7 +126,8 @@ pub fn config_from_env() -> Config {
   match @env.get_env_var("VSCODE_CHAT_PROXY_UPSTREAM") {
     Some(v) =>
       match parse_address(v) {
-        Ok((h, p)) => cfg = { ..cfg, upstream_host: h, upstream_port: p, }
+        Ok((h, p)) =>
+          cfg = { ..cfg, upstream_host: h, upstream_port: p, forward: false, }
         Err(_) => ()
       }
     None => ()
@@ -207,6 +218,11 @@ fn parse_config_exn(
       i += 1
       continue
     }
+    if v.equal_ignore_ascii_case("--forward") || v.equal_ignore_ascii_case("-f") {
+      cfg = { ..cfg, forward: true, }
+      i += 1
+      continue
+    }
     let (name, inline) = match v.split_once("=") {
       Some((n, val)) => (n.to_owned(), Some(val.to_owned()))
       None => (arg, None)
@@ -228,7 +244,7 @@ fn parse_config_exn(
       }
       "--upstream" | "-u" => {
         let (h, p) = split_host_port(value)
-        cfg = { ..cfg, upstream_host: h, upstream_port: p, }
+        cfg = { ..cfg, upstream_host: h, upstream_port: p, forward: false, }
       }
       "--web" | "-w" =>
         if value.clamped_view().equal_ignore_ascii_case("off") ||

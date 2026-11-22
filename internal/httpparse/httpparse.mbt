@@ -94,6 +94,63 @@ pub fn is_chat_completions(http_method : String, target : String) -> Bool {
 }
 
 ///|
+/// Parse an authority (`host`, `host:port`, `[ipv6]:port`) with a default
+/// port when none is given. Used for CONNECT targets and `Host` headers.
+pub fn parse_authority(s : String, default_port : Int32) -> (String, Int32)? {
+  let v = s.clamped_view().trim()
+  if v.is_empty() {
+    return None
+  }
+  let (host, port_str) = if v.has_prefix("[") {
+    match v.split_once("]:") {
+      Some((h, p)) => (h.clamped_view(start=1).to_owned(), Some(p))
+      None =>
+        match v.split_once("]") {
+          Some((h, _)) => (h.clamped_view(start=1).to_owned(), None)
+          None => return None
+        }
+    }
+  } else {
+    match v.split_once(":") {
+      Some((h, p)) => (h.to_owned(), Some(p))
+      None => (v.to_owned(), None)
+    }
+  }
+  if host.is_empty() {
+    return None
+  }
+  let port = match port_str {
+    Some(p) => @string.parse_int(p.trim()) catch { _ => return None }
+    None => default_port
+  }
+  if port < 1 || port > 65535 {
+    return None
+  }
+  Some((host, port))
+}
+
+///|
+/// Split an absolute-form `http://host[:port]/path?query` target into
+/// (host, port, path-with-query). Returns None for non-http schemes
+/// (https needs MITM, which this proxy does not do) or malformed URLs.
+pub fn absolute_http_target(target : String) -> (String, Int32, String)? {
+  let v = target.clamped_view()
+  if !v.has_prefix("http://") {
+    return None
+  }
+  let rest = v.clamped_view(start=7)
+  let (authority, path) = match rest.find("/") {
+    Some(i) => (rest.clamped_view(end=i), rest.clamped_view(start=i).to_owned())
+    None => (rest, "/")
+  }
+  let (host, port) = match parse_authority(authority.to_owned(), 80) {
+    Some(pair) => pair
+    None => return None
+  }
+  Some((host, port, path))
+}
+
+///|
 /// Rebuild the request head for the upstream connection:
 /// rewrite `Host`, force `Connection: close`, drop hop-by-hop headers
 /// and set `Content-Length` to the (possibly rewritten) body size.
@@ -120,6 +177,7 @@ pub fn build_upstream_head(
       n.equal_ignore_ascii_case("expect") ||
       n.equal_ignore_ascii_case("keep-alive") ||
       n.equal_ignore_ascii_case("proxy-connection") ||
+      n.equal_ignore_ascii_case("proxy-authorization") ||
       n.equal_ignore_ascii_case("te") ||
       n.equal_ignore_ascii_case("trailer") ||
       n.equal_ignore_ascii_case("upgrade") {

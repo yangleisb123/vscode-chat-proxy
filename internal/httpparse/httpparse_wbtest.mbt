@@ -101,3 +101,33 @@ test "http: build_upstream_head omits port 80 and content-length when asked" {
   assert_true(out.contains("Host: api.local\r\n"))
   assert_true(!out.contains("Content-Length"))
 }
+
+///|
+test "httpparse: parse_authority forms" {
+  assert_eq(parse_authority("example.com", 443), Some(("example.com", 443)))
+  assert_eq(
+    parse_authority("example.com:8443", 443),
+    Some(("example.com", 8443)),
+  )
+  assert_eq(parse_authority("[::1]:8080", 80), Some(("::1", 8080)))
+  assert_eq(parse_authority("[::1]", 80), Some(("::1", 80)))
+  assert_eq(parse_authority("", 80), None)
+  assert_eq(parse_authority("host:0", 80), None)
+  assert_eq(parse_authority("host:99999", 80), None)
+  assert_eq(parse_authority("host:abc", 80), None)
+}
+
+///|
+test "httpparse: absolute_http_target splits host port path" {
+  assert_eq(
+    absolute_http_target("http://api.example.com/v1/chat/completions"),
+    Some(("api.example.com", 80, "/v1/chat/completions")),
+  )
+  assert_eq(
+    absolute_http_target("http://127.0.0.1:18080/v1/models?x=1"),
+    Some(("127.0.0.1", 18080, "/v1/models?x=1")),
+  )
+  assert_eq(absolute_http_target("http://host"), Some(("host", 80, "/")))
+  assert_eq(absolute_http_target("https://host/v1"), None)
+  assert_eq(absolute_http_target("/v1/chat/completions"), None)
+}

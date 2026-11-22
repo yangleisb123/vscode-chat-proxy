@@ -2,6 +2,7 @@ import {
   "1123Javayanglei/vscode-chat-proxy/config",
   "1123Javayanglei/vscode-chat-proxy/monitor",
   "1123Javayanglei/vscode-chat-proxy/internal/httpparse",
+  "moonbitlang/async",
   "moonbitlang/async/socket",
   "moonbitlang/core/buffer",
   "moonbitlang/core/json",

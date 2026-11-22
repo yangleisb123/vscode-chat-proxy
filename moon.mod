@@ -11,7 +11,7 @@
 
 name = "1123Javayanglei/vscode-chat-proxy"
 
-version = "0.6.0"
+version = "0.7.0"
 
 readme = "README.mbt.md"
 
@@ -34,4 +34,5 @@ import {
   "moonbitlang/moonback@0.8.11",
   "moonbitstack/moonsqlite@0.4.1",
   "moonbitstack/moondb@0.3.1",
+  "oilleelssq-wq/MoonBit-PKI@0.2.0",
 }

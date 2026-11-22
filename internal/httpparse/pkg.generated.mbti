@@ -2,11 +2,15 @@
 package "1123Javayanglei/vscode-chat-proxy/internal/httpparse"
 
 // Values
+pub fn absolute_http_target(String) -> (String, Int32, String)?
+
 pub fn build_upstream_head(RequestHead, String, Int32, Int32, Bool) -> String
 
 pub fn header_value(RequestHead, String) -> String?
 
 pub fn is_chat_completions(String, String) -> Bool
+
+pub fn parse_authority(String, Int32) -> (String, Int32)?
 
 pub fn parse_header_line(String) -> (String, String)?
 

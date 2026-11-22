@@ -27,7 +27,7 @@ pub(all) struct Flow {
   http_method : String
   target : String
   request_headers : Array[(String, String)]
-  request_size : Int32
+  mut request_size : Int32
   intercepted : Bool
   upstream : String
   mut request_body : Bytes

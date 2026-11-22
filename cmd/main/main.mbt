@@ -60,12 +60,19 @@ async fn main {
         ":" +
         cfg.listen_port.to_string(),
       )
-      println(
-        "[proxy] upstream: " +
-        cfg.upstream_host +
-        ":" +
-        cfg.upstream_port.to_string(),
-      )
+      if cfg.forward {
+        println(
+          "[proxy] mode: forward (mitmproxy-style, destination from each request)",
+        )
+        println("[proxy] CONNECT: blind tunnel (HTTPS passes through, no MITM)")
+      } else {
+        println(
+          "[proxy] mode: reverse, upstream: " +
+          cfg.upstream_host +
+          ":" +
+          cfg.upstream_port.to_string(),
+        )
+      }
       println("[proxy] system prompt: \"" + cfg.system_prompt + "\"")
       println("[proxy] intercepting POST */v1/chat/completions")
       server.run_forever((conn, peer) => {
@@ -84,12 +91,17 @@ async fn main {
 fn usage() -> String {
   "Usage: vscode-chat-proxy [options]\n" +
   "\n" +
-  "A local HTTP proxy that ensures the system message of Chat Completions\n" +
-  "requests starts with the configured VSCode AI-assistant sentence.\n" +
+  "A local forward proxy (mitmproxy-style): point your application's HTTP\n" +
+  "proxy setting at it and requests are forwarded to their original address,\n" +
+  "with the Chat Completions system message rewritten on the way.\n" +
+  "HTTPS (CONNECT) is tunneled blindly: encrypted bodies are not inspectable.\n" +
+  "With --upstream it instead acts as a reverse proxy pinned to that server.\n" +
   "\n" +
   "Options:\n" +
   "  -l, --listen <host:port>    Local address to listen on (default 127.0.0.1:8787)\n" +
-  "  -u, --upstream <host:port>  Upstream HTTP API server (default 127.0.0.1:8080)\n" +
+  "  -u, --upstream <host:port>  Pin a fixed upstream (reverse-proxy mode);\n" +
+  "                              omit for forward mode (default)\n" +
+  "  -f, --forward               Force forward mode even if .env pins an upstream\n" +
   "  -w, --web <host:port|off>   Monitor web UI address (default 127.0.0.1:8788)\n" +
   "      --no-web                Disable the monitor web UI\n" +
   "  -s, --system-prompt <text>  Sentence forced to open the system message\n" +
@@ -101,7 +113,7 @@ fn usage() -> String {
   "\n" +
   "Environment variables:\n" +
   "  HOST / PORT                 Listen address (default 127.0.0.1 / 8787)\n" +
-  "  UPSTREAM_HOST / UPSTREAM_PORT  Upstream address (default 127.0.0.1 / 8080)\n" +
+  "  UPSTREAM_HOST / UPSTREAM_PORT  Pin upstream (reverse mode); unset = forward\n" +
   "  WEB_HOST / WEB_PORT         Monitor UI address (default 127.0.0.1 / 8788)\n" +
   "  MONITOR_DIR                 Monitor data directory (default: system temp\n" +
   "                              directory / vscode-chat-proxy-monitor-<WEB_PORT>)\n" +

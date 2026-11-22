@@ -86,3 +86,23 @@ test "config: system prompt option" {
     parse_config(["prog", "--system-prompt", "   "], default_config()) is Err(_),
   )
 }
+
+///|
+test "config: forward mode is default, upstream pins reverse" {
+  assert_true(default_config().forward)
+  let reverse = parse_config(
+    ["prog", "--upstream", "10.0.0.1:9000"],
+    default_config(),
+  )
+  assert_true(
+    reverse
+    is Ok(
+      { forward: false, upstream_host: "10.0.0.1", upstream_port: 9000, .. },
+    ),
+  )
+  let back = parse_config(
+    ["prog", "--upstream", "10.0.0.1:9000", "--forward"],
+    default_config(),
+  )
+  assert_true(back is Ok({ forward: true, .. }))
+}

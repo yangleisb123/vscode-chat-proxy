@@ -44,7 +44,7 @@ async fn handle_connection_inner(
     }
   }
   if http_method == "CONNECT" {
-    send_simple(client, 405, "Method Not Allowed")
+    handle_connect(client, target, store, client_addr)
     return
   }
   let headers : Array[(String, String)] = []
@@ -59,7 +59,45 @@ async fn handle_connection_inner(
       None => return // EOF in the middle of headers
     }
   }
-  let head : @httpparse.RequestHead = { http_method, target, headers, }
+  // Destination: in forward-proxy mode it is derived from the request itself
+  // (absolute-form URL, or the Host header for origin-form targets), exactly
+  // like mitmproxy; reverse mode keeps the pinned upstream.
+  let (up_host, up_port, out_target) = if cfg.forward {
+    if target.clamped_view().has_prefix("http://") {
+      match @httpparse.absolute_http_target(target) {
+        Some((h, p, path)) => (h, p, path)
+        None => {
+          send_simple(client, 400, "Bad Request")
+          return
+        }
+      }
+    } else if target.clamped_view().has_prefix("https://") {
+      send_simple(client, 501, "HTTPS MITM Not Supported")
+      return
+    } else {
+      match @httpparse.header_value({ http_method, target, headers, }, "host") {
+        Some(hv) =>
+          match @httpparse.parse_authority(hv, 80) {
+            Some((h, p)) => (h, p, target)
+            None => {
+              send_simple(client, 400, "Bad Host Header")
+              return
+            }
+          }
+        None => {
+          send_simple(client, 400, "Missing Host Header")
+          return
+        }
+      }
+    }
+  } else {
+    (cfg.upstream_host, cfg.upstream_port, target)
+  }
+  let head : @httpparse.RequestHead = {
+    http_method,
+    target: out_target,
+    headers,
+  }
   if @httpparse.header_value(head, "upgrade") is Some(_) {
     send_simple(client, 501, "Not Implemented")
     return
@@ -69,8 +107,8 @@ async fn handle_connection_inner(
     client.write("HTTP/1.1 100 Continue\r\n\r\n")
   }
   let body = read_request_body(client, head)
-  let intercepted = @httpparse.is_chat_completions(http_method, target)
-  let upstream_addr = cfg.upstream_host + ":" + cfg.upstream_port.to_string()
+  let intercepted = @httpparse.is_chat_completions(http_method, out_target)
+  let upstream_addr = up_host + ":" + up_port.to_string()
   let flow = store.begin(
     client_addr~,
     http_method~,
@@ -128,10 +166,7 @@ async fn handle_connection_inner(
       )
     }
   }
-  let upstream = @socket.Tcp::connect_to_host(
-    cfg.upstream_host,
-    port=cfg.upstream_port,
-  ) catch {
+  let upstream = @socket.Tcp::connect_to_host(up_host, port=up_port) catch {
     e => {
       println("[proxy] upstream connect failed: " + e.to_string())
       flow.error = Some("upstream connect failed: " + e.to_string())
@@ -151,8 +186,8 @@ async fn handle_connection_inner(
     http_method == "PATCH"
   let out_head = @httpparse.build_upstream_head(
     head,
-    cfg.upstream_host,
-    cfg.upstream_port,
+    up_host,
+    up_port,
     out_body.length(),
     send_cl,
   )
@@ -227,6 +262,139 @@ async fn handle_connection_inner(
   flow.response_size = resp_size
   flow.response_truncated = resp_size > @monitor.body_capture_limit
   store.finish(flow)
+}
+
+///|
+/// Byte counters for a blind CONNECT tunnel (client->upstream / reverse).
+priv struct TunnelStats {
+  mut up : Int32
+  mut down : Int32
+}
+
+///|
+/// Task handles so whichever pump ends first can cancel the other (a blocked
+/// read is not guaranteed to wake when the socket is closed).
+priv struct TunnelCtl {
+  mut up_task : @async.Task[Unit]?
+  mut down_task : @async.Task[Unit]?
+}
+
+///|
+/// CONNECT: establish a blind TCP tunnel to the requested authority and pump
+/// bytes both ways until either side closes. TLS traffic passes through
+/// untouched (no MITM), so bodies are not inspectable; the monitor records
+/// the connection and its byte counts.
+async fn handle_connect(
+  client : @socket.Tcp,
+  target : String,
+  store : @monitor.FlowStore,
+  client_addr : String,
+) -> Unit {
+  let (host, port) = match @httpparse.parse_authority(target, 443) {
+    Some(pair) => pair
+    None => {
+      send_simple(client, 400, "Bad CONNECT Target")
+      return
+    }
+  }
+  // Consume the CONNECT request headers before switching to raw pumping.
+  let headers : Array[(String, String)] = []
+  for ;; {
+    match client.read_until("\r\n") {
+      Some("") => break
+      Some(l) =>
+        match @httpparse.parse_header_line(l) {
+          Some(h) => headers.push(h)
+          None => ()
+        }
+      None => return
+    }
+  }
+  let flow = store.begin(
+    client_addr~,
+    http_method="CONNECT",
+    target~,
+    request_headers=headers,
+    request_body=@utf8.encode(""),
+    intercepted=false,
+    upstream=host + ":" + port.to_string(),
+  )
+  errdefer (if !flow.finished {
+    if flow.error is None {
+      flow.error = Some("connection aborted")
+    }
+    store.finish(flow)
+  })
+  let upstream = @socket.Tcp::connect_to_host(host, port~) catch {
+    e => {
+      flow.error = Some("upstream connect failed: " + e.to_string())
+      flow.status = 502
+      flow.reason = "Bad Gateway"
+      send_simple(client, 502, "Bad Gateway")
+      store.finish(flow)
+      return
+    }
+  }
+  defer upstream.close()
+  client.write("HTTP/1.1 200 Connection Established\r\n\r\n")
+  flow.status = 200
+  flow.reason = "Connection Established"
+  println("[proxy] CONNECT " + target + " -> blind tunnel (no MITM)")
+  let stats : TunnelStats = { up: 0, down: 0, }
+  let ctl : TunnelCtl = { up_task: None, down_task: None, }
+  @async.with_task_group() <| group => {
+    let t1 = group.spawn(allow_failure=true) <| () => {
+      pump(client, upstream, stats, true)
+      match ctl.down_task {
+        Some(t) => t.cancel()
+        None => ()
+      }
+    }
+    let t2 = group.spawn(allow_failure=true) <| () => {
+      pump(upstream, client, stats, false)
+      match ctl.up_task {
+        Some(t) => t.cancel()
+        None => ()
+      }
+    }
+    ctl.up_task = Some(t1)
+    ctl.down_task = Some(t2)
+  }
+  flow.request_size = stats.up
+  flow.response_size = stats.down
+  client.close()
+  upstream.close()
+  store.finish(flow)
+}
+
+///|
+/// Pump one direction of a tunnel. On EOF or write error just return: the
+/// wrapper cancels the sibling pump (cancellation must happen while sockets
+/// are still open, otherwise CancelIoEx cannot wake a blocked read), and the
+/// sockets are closed once the whole group finishes.
+async fn pump(
+  src : @socket.Tcp,
+  dst : @socket.Tcp,
+  stats : TunnelStats,
+  is_up : Bool,
+) -> Unit {
+  for ;; {
+    match src.read_some(max_len=65536) {
+      Some(chunk) => {
+        // Count before writing: a cancellation landing on the write's
+        // suspension point must not lose the byte count.
+        if is_up {
+          stats.up += chunk.length()
+        } else {
+          stats.down += chunk.length()
+        }
+        dst.write(chunk) catch {
+          _ => break
+        }
+      }
+      None => break
+    }
+  }
 }
 
 ///|

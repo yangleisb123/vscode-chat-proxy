@@ -15,7 +15,7 @@ pub(all) struct Flow {
   http_method : String
   target : String
   request_headers : Array[(String, String)]
-  request_size : Int32
+  mut request_size : Int32
   intercepted : Bool
   upstream : String
   mut request_body : Bytes
@@ -397,6 +397,7 @@ pub fn FlowStore::finish(self : FlowStore, flow : Flow) -> Unit {
     |> ignore
   }
   let values : Array[@moondb.Value] = [
+    @moondb.Int(flow.request_size),
     @moondb.Int(bool_int(flow.injected)),
     match flow.upstream_body {
       Some(body) => @moondb.Blob(body)
@@ -722,9 +723,9 @@ let insert_flow_sql : String = "INSERT INTO flows (" +
   ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
 
 ///|
-/// Update statement used by `FlowStore::finish` (12 fields + id).
+/// Update statement used by `FlowStore::finish` (13 fields + id).
 let update_flow_sql : String = "UPDATE flows SET " +
-  "injected = ?, upstream_body = ?, upstream_truncated = ?, status = ?, " +
+  "request_size = ?, injected = ?, upstream_body = ?, upstream_truncated = ?, status = ?, " +
   "reason = ?, response_headers = ?, response_body = ?, " +
   "response_size = ?, response_truncated = ?, end_ms = ?, error = ?, " +
   "finished = 1, content_type = ? WHERE id = ?"

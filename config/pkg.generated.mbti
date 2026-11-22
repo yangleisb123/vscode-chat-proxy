@@ -25,6 +25,7 @@ pub(all) struct Config {
   listen_port : Int32
   upstream_host : String
   upstream_port : Int32
+  forward : Bool
   web_enabled : Bool
   web_host : String
   web_port : Int32
