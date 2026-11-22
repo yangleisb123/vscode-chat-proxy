@@ -11,7 +11,7 @@
 
 name = "1123Javayanglei/vscode-chat-proxy"
 
-version = "0.3.1"
+version = "0.4.0"
 
 readme = "README.mbt.md"
 
@@ -30,4 +30,6 @@ description = "Local HTTP proxy that ensures Chat Completions system messages st
 import {
   "moonbitlang/async@0.22.10",
   "moonbit-community/rabbita@0.17.0",
+  "spectacleCase/dotenv@0.1.0",
+  "moonbitlang/moonback@0.8.11",
 }

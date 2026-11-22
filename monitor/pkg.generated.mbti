@@ -3,7 +3,6 @@ package "1123Javayanglei/vscode-chat-proxy/monitor"
 
 import {
   "1123Javayanglei/vscode-chat-proxy/shared",
-  "moonbitlang/async/socket",
 }
 
 // Values
@@ -13,7 +12,7 @@ pub fn cap_bytes(Bytes) -> (Bytes, Bool)
 
 pub fn decode_chunked_body(Bytes) -> Bytes
 
-pub async fn run_web_server(@socket.Addr, FlowStore) -> Unit
+pub async fn run_web_server(String, Int32, FlowStore) -> Unit
 
 // Errors
 

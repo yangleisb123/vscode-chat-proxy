@@ -1,4 +1,5 @@
 import {
+  "spectacleCase/dotenv" @dotenv_lib,
   "moonbitlang/async/fs",
   "moonbitlang/core/env",
 }

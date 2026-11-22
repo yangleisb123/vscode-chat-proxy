@@ -1,99 +1,55 @@
 ///|
-/// Run the monitor web server (mitmweb-style UI + JSON API).
-pub async fn run_web_server(addr : @socket.Addr, store : FlowStore) -> Unit {
-  let server = @socket.TcpServer(addr, reuse_addr=true)
-  server.run_forever((conn, _) => handle_web_connection(conn, store))
-}
+/// Monitor web server, built on the moonback framework (routing, response
+/// helpers, connection handling) instead of hand-rolled HTTP plumbing.
 
 ///|
-async fn handle_web_connection(conn : @socket.Tcp, store : FlowStore) -> Unit {
-  handle_web_inner(conn, store) catch {
-    e => println("[web] connection error: " + e.to_string())
-  }
-}
-
-///|
-async fn handle_web_inner(conn : @socket.Tcp, store : FlowStore) -> Unit {
-  let line = match conn.read_until("\r\n") {
-    Some(l) if !l.is_empty() => l
-    _ => return
-  }
-  let (http_method, target, _version) = match
-    @httpparse.parse_request_line(line) {
-    Some(parts) => parts
-    None => {
-      send_text(conn, 400, "Bad Request", "text/plain", "bad request")
-      return
-    }
-  }
-  // Drain headers (the monitor API never needs a request body).
-  for ;; {
-    match conn.read_until("\r\n") {
-      Some("") => break
-      Some(_) => ()
-      None => return
-    }
-  }
-  let path = @httpparse.target_path(target)
-  if http_method == "GET" && path == "/" {
-    send_text(conn, 200, "OK", "text/html; charset=utf-8", index_html)
-  } else if http_method == "GET" && path == "/frontend.js" {
-    send_text(conn, 200, "OK", "text/javascript; charset=utf-8", frontend_js)
-  } else if http_method == "GET" && path == "/api/flows" {
-    send_json(conn, store.list_response().to_json())
-  } else if http_method == "GET" && path.has_prefix("/api/flows/") {
-    let id_str = path.clamped_view(start=11).to_owned()
-    let id = @string.parse_int(id_str.clamped_view()) catch {
-      _ => {
-        send_text(conn, 404, "Not Found", "text/plain", "invalid flow id")
-        return
-      }
-    }
-    match store.find(id) {
-      Some(flow) => send_json(conn, flow.detail().to_json())
-      None => send_text(conn, 404, "Not Found", "text/plain", "flow not found")
-    }
-  } else if http_method == "DELETE" && path == "/api/flows" {
-    store.clear()
-    send_json(conn, Json::object({ "ok": Json::boolean(true) }))
-  } else {
-    send_text(conn, 404, "Not Found", "text/plain", "not found")
-  }
-}
-
-///|
-async fn send_json(conn : @socket.Tcp, json : Json) -> Unit {
-  send_text(
-    conn,
-    200,
-    "OK",
-    "application/json; charset=utf-8",
-    json.stringify(),
-  )
-}
-
-///|
-async fn send_text(
-  conn : @socket.Tcp,
-  code : Int32,
-  reason : String,
-  content_type : String,
-  body : String,
+/// Serve the monitor UI and JSON API on `host:port`.
+pub async fn run_web_server(
+  host : String,
+  port : Int32,
+  store : FlowStore,
 ) -> Unit {
-  let bytes = @utf8.encode(body)
-  let head = "HTTP/1.1 " +
-    code.to_string() +
-    " " +
-    reason +
-    "\r\n" +
-    "Content-Type: " +
-    content_type +
-    "\r\n" +
-    "Content-Length: " +
-    bytes.length().to_string() +
-    "\r\n" +
-    "Cache-Control: no-store\r\n" +
-    "Connection: close\r\n\r\n"
-  conn.write(head)
-  conn.write(bytes)
+  let app = @moonback.App(
+    @moonback.Module(ctx => {
+      ctx.get("/", (_req, res) => {
+        res.send_text(index_html, headers=[
+          ("Content-Type", "text/html; charset=utf-8"),
+        ])
+      })
+      ctx.get("/frontend.js", (_req, res) => {
+        res.send_text(frontend_js, headers=[
+          ("Content-Type", "text/javascript; charset=utf-8"),
+        ])
+      })
+      ctx.get("/api/flows", (_req, res) => {
+        res.send_json(store.list_response().to_json())
+      })
+      ctx.get("/api/flows/:id", (req, res) => {
+        let id = match req.params.get("id") {
+          Some(s) =>
+            @string.parse_int(s) catch {
+              _ => {
+                res.send_text("invalid flow id", status=404)
+                return
+              }
+            }
+          None => {
+            res.send_text("invalid flow id", status=404)
+            return
+          }
+        }
+        match store.find(id) {
+          Some(flow) => res.send_json(flow.detail().to_json())
+          None => res.send_text("flow not found", status=404)
+        }
+      })
+      ctx.add_route(@http.RequestMethod::Delete, "/api/flows", (_req, res) => {
+        store.clear()
+        res.send_json(@json.Json::object({ "ok": @json.Json::boolean(true) }))
+      })
+    }),
+  )
+  defer app.close()
+  let server = @moonback.listen(host~, port=port.to_uint16(), reuse_addr=true)
+  app.serve(server)
 }

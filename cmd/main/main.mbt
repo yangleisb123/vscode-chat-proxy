@@ -26,17 +26,13 @@ async fn main {
       if cfg.web_enabled {
         group.spawn_bg(allow_failure=true) <| () => {
           try {
-            let web_addr = @socket.Addr::resolve(
-              cfg.web_host,
-              port=cfg.web_port,
-            )
             println(
               "[web] monitor UI on http://" +
               cfg.web_host +
               ":" +
               cfg.web_port.to_string(),
             )
-            @proxy.run_web_server(web_addr, store)
+            @proxy.run_web_server(cfg.web_host, cfg.web_port, store)
           } catch {
             e => println("[web] monitor UI failed: " + e.to_string())
           }

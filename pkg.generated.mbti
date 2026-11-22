@@ -26,7 +26,7 @@ pub fn parse_config(Array[String], @config.Config) -> Result[@config.Config, Str
 
 pub let required_prefix : String
 
-pub async fn run_web_server(@socket.Addr, @monitor.FlowStore) -> Unit
+pub async fn run_web_server(String, Int32, @monitor.FlowStore) -> Unit
 
 pub fn wants_help(Array[String]) -> Bool
 

@@ -1,15 +1,12 @@
 import {
   "1123Javayanglei/vscode-chat-proxy/shared",
-  "1123Javayanglei/vscode-chat-proxy/internal/httpparse",
-  "moonbitlang/async/socket",
+  "moonbitlang/moonback",
+  "moonbitlang/async/http",
   "moonbitlang/core/buffer",
+  "moonbitlang/core/json",
   "moonbitlang/core/string",
   "moonbitlang/core/env",
   "moonbitlang/core/encoding/utf8",
 }
-
-import {
-  "moonbitlang/core/json",
-} for "wbtest"
 
 supported_targets = "+native+wasm"

@@ -13,6 +13,21 @@
 本项目按 [MoonBit 全栈教程](https://docs.moonbitlang.cn/tutorial/fullstack-one-project.html) 组织：
 **前端也是 MoonBit**（[rabbita](https://mooncakes.io/docs/moonbit-community/rabbita) Elm 架构，编译为 JS），
 前后端通过 `shared/` 包里 `#derive(ToJson, FromJson)` 的契约类型通信，wire 格式只定义一次。
+尽量复用 mooncakes 生态而非自研：监控 Web 服务器用
+[moonback](https://mooncakes.io/docs/moonbitlang/moonback)（路由/响应helpers/连接管理），
+`.env` 解析用 [spectacleCase/dotenv](https://mooncakes.io/docs/spectacleCase/dotenv)。
+
+## 依赖（mooncakes.io）
+
+| 包 | 用途 |
+|---|---|
+| `moonbitlang/async` | 异步运行时 + TCP socket（代理数据面、SSE 透传） |
+| `moonbitlang/moonback` | 监控 Web 服务器：路由（含 `:id` 参数）、JSON/文本响应、连接管理 |
+| `moonbit-community/rabbita` | 监控前端 Elm 架构 UI 框架（js 目标） |
+| `spectacleCase/dotenv` | `.env` 文本解析（引号/export/行内注释/BOM/容错） |
+
+自研部分只保留生态里没有的：代理数据面（TCP 级转发 + system 前缀注入）、
+流量捕获环形缓存、以及把前端产物内嵌进单二进制的构建脚本。
 
 ## 拦截规则
 
@@ -110,7 +125,9 @@ curl http://127.0.0.1:8787/v1/chat/completions \
 
 页面本身是 MoonBit 全栈应用：`frontend/` 用 rabbita 的 Elm 架构（model/update/view +
 `@sub.every` 轮询订阅 + `@rhttp.expect_json` 类型化请求）编译成 JS，由后端在
-`GET /frontend.js` 提供；`GET /` 提供 HTML 外壳。前后端共用 `shared/` 的
+`GET /frontend.js` 提供；`GET /` 提供 HTML 外壳。后端 Web 层用 moonback 框架
+（`ctx.get("/api/flows/:id", …)` 路由参数、`res.send_json` 等），不再手写 HTTP 服务 plumbing。
+前后端共用 `shared/` 的
 `FlowSummary` / `FlowsResponse` / `FlowDetail` 等契约类型（`#derive(ToJson, FromJson)`），
 改一处字段两端自动同步。构建产物内嵌进 `web_assets.mbt`（由 `tools/build_web.mbtx`
 生成并提交），因此**部署仍是单个可执行文件**，无需附带前端文件。
@@ -171,7 +188,7 @@ moon test frontend --target js  # 前端 update 逻辑单测
 ## 测试
 
 ```bash
-moon test                 # 46 个后端/契约单元测试（默认 wasm 目标）
+moon test                 # 41 个后端/契约单元测试（默认 wasm 目标）
 moon test --target native # Linux / 有 MSVC 的 Windows
 moon test frontend --target js  # 7 个前端 Elm update 逻辑测试
 moon check --target all   # 全目标类型检查
@@ -198,10 +215,11 @@ moon.pkg / facade.mbt   # 根 facade：pub using 再导出各层公共 API（旧
 shared/                 # 前后端共享 API 契约类型（#derive(ToJson, FromJson)）
 proxy/                  # 代理核心：system 前缀注入 + 连接处理/转发/捕获
 monitor/                # 监控层：Flow/FlowStore 环形缓存、chunked 解码、
-                        #   Web 服务器与 JSON API、内嵌资源 web_assets.mbt
+                        #   moonback Web 服务器与 JSON API、内嵌资源 web_assets.mbt
 config/                 # 配置层：Config、命令行/环境变量解析
-internal/httpparse/     # 实现支持：HTTP 请求行/状态行/头部解析、请求头重建
-internal/dotenv/        # 实现支持：.env 文件加载
+internal/httpparse/     # 实现支持：代理数据面的 HTTP 解析/请求头重建
+internal/dotenv/        # 实现支持：.env 异步读取 + 不覆盖已有环境变量
+                        #   （解析委托 spectacleCase/dotenv）
 frontend/               # 监控前端：rabbita Elm 架构（js 目标）+ update 单测
 web/index.html          # 监控页面 HTML 外壳（CSS + 挂载点）
 tools/build_web.mbtx    # 构建前端并生成 monitor/web_assets.mbt（.mbtx 自动化）
