@@ -15,7 +15,7 @@ version = "0.1.0"
 
 readme = "README.mbt.md"
 
-repository = "https://github.com/1123Javayanglei/vscode-chat-proxy"
+repository = "https://github.com/yangleisb123/vscode-chat-proxy"
 
 license = "Apache-2.0"
 
