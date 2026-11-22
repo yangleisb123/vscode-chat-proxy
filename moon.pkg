@@ -16,4 +16,4 @@ import {
   "1123Javayanglei/vscode-chat-proxy/internal/dotenv" @dotenv_impl,
 }
 
-supported_targets = "+native+wasm"
+supported_targets = "+native"

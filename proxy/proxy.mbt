@@ -80,14 +80,12 @@ async fn handle_connection_inner(
     intercepted~,
     upstream=upstream_addr,
   )
-  // Finalize the flow even if the connection aborts mid-way. Persisting to
-  // disk is protected from cancellation so an aborted client does not lose
-  // the record.
+  // Finalize the flow even if the connection aborts mid-way.
   errdefer (if !flow.finished {
     if flow.error is None {
       flow.error = Some("connection aborted")
     }
-    @async.protect_from_cancel(() => store.finish(flow))
+    store.finish(flow)
   })
   let mut out_body = body
   if intercepted {

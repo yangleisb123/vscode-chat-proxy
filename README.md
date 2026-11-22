@@ -17,7 +17,8 @@
 前后端通过 `shared/` 包里 `#derive(ToJson, FromJson)` 的契约类型通信，wire 格式只定义一次。
 尽量复用 mooncakes 生态而非自研：监控 Web 服务器用
 [moonback](https://mooncakes.io/docs/moonbitlang/moonback)（路由/响应helpers/连接管理），
-`.env` 解析用 [spectacleCase/dotenv](https://mooncakes.io/docs/spectacleCase/dotenv)。
+`.env` 解析用 [spectacleCase/dotenv](https://mooncakes.io/docs/spectacleCase/dotenv)，
+监控存储用 [moonsqlite](https://mooncakes.io/docs/moonbitstack/moonsqlite)（自带 SQLite amalgamation，无系统依赖）。
 
 ## 依赖（mooncakes.io）
 
@@ -27,9 +28,10 @@
 | `moonbitlang/moonback` | 监控 Web 服务器：路由（含 `:id` 参数）、JSON/文本响应、连接管理 |
 | `moonbit-community/rabbita` | 监控前端 Elm 架构 UI 框架（js 目标） |
 | `spectacleCase/dotenv` | `.env` 文本解析（引号/export/行内注释/BOM/容错） |
+| `moonbitstack/moonsqlite` | 嵌入式 SQLite（自带 amalgamation，native 目标） |
 
 自研部分只保留生态里没有的：代理数据面（TCP 级转发 + system 前缀注入）、
-流量捕获环形缓存、以及把前端产物内嵌进单二进制的构建脚本。
+流量捕获 SQLite 存储、以及把前端产物内嵌进单二进制的构建脚本。
 
 ## 拦截规则
 
@@ -55,7 +57,8 @@
 
 ## 快速开始
 
-只需要 MoonBit 工具链（`moon` 已安装即可，**无需其他依赖**）。
+只需要 MoonBit 工具链（`moon` 已安装即可；native 目标另需 C 编译器，Windows 上用 MSVC。
+SQLite 已随程序静态编译，**无需安装 SQLite**）。
 
 ```bash
 cd vscode-chat-proxy
@@ -64,7 +67,7 @@ cd vscode-chat-proxy
 cp .env.example .env        # Windows PowerShell: Copy-Item .env.example .env
 # 按需编辑 .env 里的 HOST / PORT / UPSTREAM_HOST / UPSTREAM_PORT / SYSTEM_PROMPT
 
-# 2. 运行（默认 wasm 目标，Windows / Linux 都开箱即用，自动读取 .env）
+# 2. 运行（默认 native 目标，自动读取 .env；需要 C 编译器 / MSVC）
 moon run cmd/main
 ```
 
@@ -151,15 +154,15 @@ curl http://127.0.0.1:8787/v1/chat/completions \
   - **响应（出参）**：状态行、全部响应头、响应体；**SSE 流式响应完整捕获并自动去除 chunked 分块 framing**；
   - **注入后转发体**：被注入前缀的请求额外提供此页签，对比实际发给上游的 body。
 - 进行中的请求（如正在输出的 SSE）实时显示为「进行中」，完成后自动补全出参。
-- 数据落在**系统临时目录**里（每个 flow 一个 JSON 文件，文件名是补零的 id）：
-  - Windows：`%TEMP%\vscode-chat-proxy-monitor-<WEB_PORT>\`
-  - macOS / Linux：`$TMPDIR`（未设置时 `/tmp`）`/vscode-chat-proxy-monitor-<WEB_PORT>/`
+- 数据落在**系统临时目录**里的单个 SQLite 文件中：
+  - Windows：`%TEMP%\vscode-chat-proxy-monitor-<WEB_PORT>\monitor.sqlite`
+  - macOS / Linux：`$TMPDIR`（未设置时 `/tmp`）`/vscode-chat-proxy-monitor-<WEB_PORT>/monitor.sqlite`
   - 可用 `MONITOR_DIR`（或 `VSCODE_CHAT_PROXY_MONITOR_DIR`）覆盖；启动日志会打印实际目录。
-- 最多保留最近 **200** 条；每个 body 最多保存 **256 KiB**（超出截断并标注）。
-  **重启后自动加载历史**，不再清空；超过 200 条时删除最旧的文件。
-- 目录清理由系统临时目录策略负责（Windows 的 `%TEMP%` 不保证自动清理，可用「存储感知」/
-  磁盘清理；Linux 的 `/tmp` 通常由 systemd-tmpfiles 或重启清理），也可随时手动删除或点「清空」。
-- 数据文件按 `0600` 创建（Windows 忽略权限位），但临时目录里的内容仍可能含 API Key。
+  - 原生目标内嵌 SQLite（`moonbitstack/moonsqlite`，编译进可执行文件），**无需系统安装 SQLite**。
+- 最多保留最近 **200** 行；每个 body 最多保存 **256 KiB**（超出截断并标注）。
+  **重启后自动加载历史**；超过 200 行时删除最旧的行，`auto_vacuum` 会回收空间。
+- 数据库按 `0600` 创建（Windows 忽略权限位），但临时目录里的内容仍可能含 API Key。
+  清理交给系统临时目录策略（Windows 的 `%TEMP%` 不保证自动清理），也可随时手动删除或点「清空」。
 - `--no-web`（或 `--web off`）不启用监控页面，也不落盘，只在内存里保留最近 200 条。
 
 JSON API（页面即基于此实现，可自行脚本化）：
@@ -187,13 +190,12 @@ moon build --target native --release
 ```
 
 - **Linux**：native 目标需要 gcc / clang（发行版自带即可），已在 OpenCloudOS 9 + gcc 12 实测通过。
-- **Windows**：native 目标按 MoonBit 官方要求需要 **MSVC**（VS Build Tools 的「使用 C++ 的桌面开发」
-  工作负载，含 Windows SDK；MinGW 不支持）。**没有 MSVC 也没关系**——默认的 wasm 目标
-  由工具链自带的 `moonrun` 运行，功能完全一致，已在 Windows 11 实测通过。
-- wasm 目标产物在 `_build/wasm/release/build/cmd/main/main.wasm`，
-  可用 `moon run cmd/main --target wasm --release -- <参数>` 运行。
+- **Windows**：native 目标需要 **MSVC**（VS Build Tools 的「使用 C++ 的桌面开发」
+  工作负载，含 Windows SDK；MinGW 不支持）。SQLite 已随程序静态编译，不需要额外安装。
+- 后端只支持 **native**（监控存储使用嵌入式 SQLite）；前端仍是 MoonBit JS，构建时内嵌。
+  不再提供 wasm 后端产物。
 - **部署**：独立二进制 + 同目录 `.env` 即可运行（与 `moonbit_claude_proxy` 相同），
-  无需 MoonBit 工具链；`.env` 从**进程工作目录**读取。前端资源已内嵌，无需额外文件。
+  无需 MoonBit 工具链；`.env` 从**进程工作目录**读取。前端资源和 SQLite 都已内嵌。
 
 ### 修改监控前端后
 
@@ -207,10 +209,9 @@ moon test frontend --target js  # 前端 update 逻辑单测
 ## 测试
 
 ```bash
-moon test                 # 51 个后端/契约单元测试（默认 wasm 目标）
-moon test --target native # Linux / 有 MSVC 的 Windows
+moon test                 # 51 个后端/契约单元测试（native）
 moon test frontend --target js  # 7 个前端 Elm update 逻辑测试
-moon check --target all   # 全目标类型检查
+moon check --target native  # 后端类型检查
 
 # 端到端测试：先起一个 mock 上游（需要 Node.js）
 node test/mock-upstream.mjs 18080
@@ -218,7 +219,7 @@ moon run cmd/main -- -l 127.0.0.1:18787 -u 127.0.0.1:18080
 # 然后向 18787 发请求，mock 会把收到的请求体原样返回，便于核对改写结果
 ```
 
-已验证场景（Windows wasm 与 Linux native 双平台）：
+已验证场景（Windows 11 + MSVC 与 Linux native）：
 无 system 插入、已有前缀放行、其他 system 文本前置注入、多模态 content、
 自定义 `SYSTEM_PROMPT` / `--system-prompt` 话术（含英文话术与自带句末标点）、
 SSE 流式透传、chunked 请求体、GET/其他路径透传、`Authorization` 等头部保留、
@@ -234,7 +235,7 @@ SSE 流式透传、chunked 请求体、GET/其他路径透传、`Authorization` 
 moon.pkg / facade.mbt   # 根 facade：pub using 再导出各层公共 API（旧导入路径兼容）
 shared/                 # 前后端共享 API 契约类型（#derive(ToJson, FromJson)）
 proxy/                  # 代理核心：system 前缀注入 + 连接处理/转发/捕获
-monitor/                # 监控层：Flow/FlowStore（临时目录 JSON 持久化）、chunked 解码、
+monitor/                # 监控层：Flow/FlowStore（系统临时目录 SQLite 持久化）、chunked 解码、
                         #   moonback Web 服务器与 JSON API、内嵌资源 web_assets.mbt
 config/                 # 配置层：Config、命令行/环境变量解析
 internal/httpparse/     # 实现支持：代理数据面的 HTTP 解析/请求头重建
@@ -261,5 +262,5 @@ test/                   # mock 上游（Node.js）+ 监控页面截图
 - 每个连接只处理一个请求（`Connection: close`）；对 API 调用场景无实际影响。
 - 请求体缓冲上限 64 MiB。
 - 只检查**第一条** system 消息；`developer` role 不视为 system。
-- 监控数据存系统临时目录（最近 200 条、每 body 256 KiB），重启后自动加载；
+- 监控数据存系统临时目录的 SQLite 文件（最近 200 行、每 body 256 KiB），重启后自动加载；
   临时目录被系统清理时历史会丢失。被代理拒绝的请求（CONNECT/Upgrade/坏请求行）不进监控列表。
