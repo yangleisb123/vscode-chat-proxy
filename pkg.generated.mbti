@@ -2,6 +2,7 @@
 package "1123Javayanglei/vscode-chat-proxy"
 
 import {
+  "1123Javayanglei/vscode-chat-proxy/shared",
   "moonbitlang/async/socket",
   "moonbitlang/core/json",
 }
@@ -72,8 +73,8 @@ pub struct Flow {
   mut error : String?
   mut finished : Bool
 }
-pub fn Flow::detail_json(Self) -> @json.Json
-pub fn Flow::summary_json(Self) -> @json.Json
+pub fn Flow::detail(Self) -> @shared.FlowDetail
+pub fn Flow::summary(Self) -> @shared.FlowSummary
 
 pub struct FlowStore {
   capacity : Int32
@@ -86,7 +87,7 @@ pub fn FlowStore::begin(Self, client_addr~ : String, http_method~ : String, targ
 pub fn FlowStore::clear(Self) -> Unit
 pub fn FlowStore::find(Self, Int32) -> Flow?
 pub fn FlowStore::finish(Self, Flow) -> Unit
-pub fn FlowStore::list_json(Self) -> @json.Json
+pub fn FlowStore::list_response(Self) -> @shared.FlowsResponse
 pub fn FlowStore::new(capacity? : Int32) -> Self
 
 // Type aliases

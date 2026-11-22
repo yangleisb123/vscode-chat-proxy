@@ -11,7 +11,7 @@
 
 name = "1123Javayanglei/vscode-chat-proxy"
 
-version = "0.2.0"
+version = "0.3.0"
 
 readme = "README.mbt.md"
 
@@ -23,8 +23,11 @@ keywords = [ "openai", "proxy", "chat-completions", "vscode" ]
 
 preferred_target = "wasm"
 
+supported_targets = "+native+wasm+js"
+
 description = "Local HTTP proxy that ensures Chat Completions system messages start with the required VSCode AI-assistant sentence"
 
 import {
   "moonbitlang/async@0.22.10",
+  "moonbit-community/rabbita@0.17.0",
 }

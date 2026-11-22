@@ -1,0 +1,97 @@
+// Generated using `moon info`, DON'T EDIT IT
+package "1123Javayanglei/vscode-chat-proxy/shared"
+
+import {
+  "moonbitlang/core/debug",
+  "moonbitlang/core/json",
+}
+
+// Values
+
+// Errors
+
+// Types and methods
+#derive(Eq, @debug.Debug, @json.FromJson, @json.ToJson)
+pub(all) struct FlowDetail {
+  id : Int32
+  start_ms : Double
+  duration_ms : Int32
+  client_addr : String
+  upstream : String
+  intercepted : Bool
+  injected : Bool
+  pending : Bool
+  error : String?
+  request : RequestData
+  upstream_request : UpstreamRequest?
+  response : ResponseData?
+}
+pub fn FlowDetail::from_json(@json.Json, @json.DecodeContext) -> Self raise @json.JsonDecodeError
+pub fn FlowDetail::to_json(Self) -> @json.Json
+
+#derive(Eq, @debug.Debug, @json.FromJson, @json.ToJson)
+pub(all) struct FlowSummary {
+  id : Int32
+  start_ms : Double
+  http_method : String
+  path : String
+  status : Int32
+  reason : String
+  intercepted : Bool
+  injected : Bool
+  pending : Bool
+  error : String?
+  req_size : Int32
+  resp_size : Int32
+  duration_ms : Int32
+  content_type : String
+}
+pub fn FlowSummary::from_json(@json.Json, @json.DecodeContext) -> Self raise @json.JsonDecodeError
+pub fn FlowSummary::to_json(Self) -> @json.Json
+
+#derive(Eq, @debug.Debug, @json.FromJson, @json.ToJson)
+pub(all) struct FlowsResponse {
+  total : Int32
+  injected_total : Int32
+  stored : Int32
+  capacity : Int32
+  flows : Array[FlowSummary]
+}
+pub fn FlowsResponse::from_json(@json.Json, @json.DecodeContext) -> Self raise @json.JsonDecodeError
+pub fn FlowsResponse::to_json(Self) -> @json.Json
+
+#derive(Eq, @debug.Debug, @json.FromJson, @json.ToJson)
+pub(all) struct RequestData {
+  http_method : String
+  target : String
+  headers : Array[(String, String)]
+  body : String
+  truncated : Bool
+  size : Int32
+}
+pub fn RequestData::from_json(@json.Json, @json.DecodeContext) -> Self raise @json.JsonDecodeError
+pub fn RequestData::to_json(Self) -> @json.Json
+
+#derive(Eq, @debug.Debug, @json.FromJson, @json.ToJson)
+pub(all) struct ResponseData {
+  status : Int32
+  reason : String
+  headers : Array[(String, String)]
+  body : String
+  truncated : Bool
+  size : Int32
+}
+pub fn ResponseData::from_json(@json.Json, @json.DecodeContext) -> Self raise @json.JsonDecodeError
+pub fn ResponseData::to_json(Self) -> @json.Json
+
+#derive(Eq, @debug.Debug, @json.FromJson, @json.ToJson)
+pub(all) struct UpstreamRequest {
+  body : String
+  truncated : Bool
+}
+pub fn UpstreamRequest::from_json(@json.Json, @json.DecodeContext) -> Self raise @json.JsonDecodeError
+pub fn UpstreamRequest::to_json(Self) -> @json.Json
+
+// Type aliases
+
+// Traits

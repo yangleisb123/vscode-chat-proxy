@@ -35,9 +35,11 @@ async fn handle_web_inner(conn : @socket.Tcp, store : FlowStore) -> Unit {
   }
   let path = target_path(target)
   if http_method == "GET" && path == "/" {
-    send_text(conn, 200, "OK", "text/html; charset=utf-8", web_page)
+    send_text(conn, 200, "OK", "text/html; charset=utf-8", index_html)
+  } else if http_method == "GET" && path == "/frontend.js" {
+    send_text(conn, 200, "OK", "text/javascript; charset=utf-8", frontend_js)
   } else if http_method == "GET" && path == "/api/flows" {
-    send_json(conn, store.list_json())
+    send_json(conn, store.list_response().to_json())
   } else if http_method == "GET" && path.has_prefix("/api/flows/") {
     let id_str = path.clamped_view(start=11).to_owned()
     let id = @string.parse_int(id_str.clamped_view()) catch {
@@ -47,7 +49,7 @@ async fn handle_web_inner(conn : @socket.Tcp, store : FlowStore) -> Unit {
       }
     }
     match store.find(id) {
-      Some(flow) => send_json(conn, flow.detail_json())
+      Some(flow) => send_json(conn, flow.detail().to_json())
       None => send_text(conn, 404, "Not Found", "text/plain", "flow not found")
     }
   } else if http_method == "DELETE" && path == "/api/flows" {

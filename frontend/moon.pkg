@@ -1,0 +1,16 @@
+import {
+  "1123Javayanglei/vscode-chat-proxy/shared",
+  "moonbit-community/rabbita",
+  "moonbit-community/rabbita/html",
+  "moonbit-community/rabbita/http" @rhttp,
+  "moonbit-community/rabbita/sub",
+  "moonbitlang/core/json",
+}
+
+import {
+  "moonbit-community/rabbita/cmd",
+} for "wbtest"
+
+supported_targets = "js"
+
+pkgtype(kind: "executable")

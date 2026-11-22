@@ -1,4 +1,5 @@
 import {
+  "1123Javayanglei/vscode-chat-proxy/shared",
   "moonbitlang/async/socket",
   "moonbitlang/async/fs",
   "moonbitlang/core/buffer",

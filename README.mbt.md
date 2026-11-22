@@ -10,6 +10,10 @@
 异步运行时（Linux epoll / Windows IOCP），单进程即可并发处理多个连接，**SSE 流式响应实时透传**。
 自带 **mitmweb 风格的监控页面**，可实时查看每个请求的入参 / 出参（见[监控页面](#监控页面mitmweb-风格)）。
 
+本项目按 [MoonBit 全栈教程](https://docs.moonbitlang.cn/tutorial/fullstack-one-project.html) 组织：
+**前端也是 MoonBit**（[rabbita](https://mooncakes.io/docs/moonbit-community/rabbita) Elm 架构，编译为 JS），
+前后端通过 `shared/` 包里 `#derive(ToJson, FromJson)` 的契约类型通信，wire 格式只定义一次。
+
 ## 拦截规则
 
 对 `POST */v1/chat/completions`（忽略 query string，支持路径带前缀如 `/openai/v1/chat/completions`）：
@@ -104,6 +108,13 @@ curl http://127.0.0.1:8787/v1/chat/completions \
 
 ![SSE 出参详情](test/monitor-ui-detail-response.png)
 
+页面本身是 MoonBit 全栈应用：`frontend/` 用 rabbita 的 Elm 架构（model/update/view +
+`@sub.every` 轮询订阅 + `@rhttp.expect_json` 类型化请求）编译成 JS，由后端在
+`GET /frontend.js` 提供；`GET /` 提供 HTML 外壳。前后端共用 `shared/` 的
+`FlowSummary` / `FlowsResponse` / `FlowDetail` 等契约类型（`#derive(ToJson, FromJson)`），
+改一处字段两端自动同步。构建产物内嵌进 `web_assets.mbt`（由 `tools/build_web.mbtx`
+生成并提交），因此**部署仍是单个可执行文件**，无需附带前端文件。
+
 - **请求列表**：所有经过代理的请求（含非拦截路径），1.5 秒自动刷新；
   显示时间 / 方法 / 路径 / 状态码 / 入出大小 / 耗时，`已注入` / `拦截` 标记，
   支持路径过滤、暂停刷新、一键清空。
@@ -119,10 +130,14 @@ JSON API（页面即基于此实现，可自行脚本化）：
 
 | 端点 | 说明 |
 |---|---|
-| `GET /` | 监控页面 |
+| `GET /` | 监控页面 HTML 外壳 |
+| `GET /frontend.js` | MoonBit 前端构建产物（内嵌） |
 | `GET /api/flows` | 请求列表 + 统计（total / injected_total / stored / capacity） |
 | `GET /api/flows/<id>` | 单条详情（请求头/体、注入后 body、响应头/体） |
 | `DELETE /api/flows` | 清空缓存 |
+
+JSON 契约见 `shared/types.mbt`；可选字段（`error` / `upstream_request` / `response`）
+为 None 时**省略键**，Some 时直接是值（MoonBit derive 的 Option 编码约定）。
 
 > ⚠️ 监控页面默认只绑定 `127.0.0.1`。请求体/响应体可能含 API Key 等敏感信息，
 > 不要把 `WEB_HOST` 设成 `0.0.0.0` 暴露到公网。
@@ -142,13 +157,24 @@ moon build --target native --release
 - wasm 目标产物在 `_build/wasm/release/build/cmd/main/main.wasm`，
   可用 `moon run cmd/main --target wasm --release -- <参数>` 运行。
 - **部署**：独立二进制 + 同目录 `.env` 即可运行（与 `moonbit_claude_proxy` 相同），
-  无需 MoonBit 工具链；`.env` 从**进程工作目录**读取。
+  无需 MoonBit 工具链；`.env` 从**进程工作目录**读取。前端资源已内嵌，无需额外文件。
+
+### 修改监控前端后
+
+```bash
+moon run tools/build_web.mbtx   # 构建 frontend(js) 并重新生成内嵌的 web_assets.mbt
+moon test frontend --target js  # 前端 update 逻辑单测
+```
+
+生成的 `web_assets.mbt` 需随源码一起提交（下游使用者不执行构建脚本）。
 
 ## 测试
 
 ```bash
-moon test                 # 42 个单元测试（默认 wasm 目标）
+moon test                 # 46 个后端/契约单元测试（默认 wasm 目标）
 moon test --target native # Linux / 有 MSVC 的 Windows
+moon test frontend --target js  # 7 个前端 Elm update 逻辑测试
+moon check --target all   # 全目标类型检查
 
 # 端到端测试：先起一个 mock 上游（需要 Node.js）
 node test/mock-upstream.mjs 18080
@@ -168,11 +194,15 @@ SSE 流式透传、chunked 请求体、GET/其他路径透传、`Authorization` 
 prefix.mbt        # 核心逻辑：system message 检查与注入（纯函数，可单测）
 http.mbt          # HTTP 请求行/状态行/头部解析、目标路径匹配、上游请求头重建
 proxy.mbt         # 异步连接处理：读请求 → 改写 → 转发 → 流式回传 + 流量捕获
-flow.mbt          # 监控数据：Flow / FlowStore 环形缓存、chunked 解码、JSON API 渲染
+flow.mbt          # 监控数据：Flow / FlowStore 环形缓存、chunked 解码、契约类型转换
 web.mbt           # 监控 Web 服务器与 JSON API 路由
-web_page.mbt      # 监控页面（内嵌单文件 HTML + 原生 JS，暗色主题）
+web_assets.mbt    # 内嵌的 HTML 外壳 + 前端 JS bundle（tools/build_web.mbtx 生成）
 config.mbt        # 命令行/地址解析、环境变量配置（config_from_env）
 dotenv.mbt        # .env 文件加载（不覆盖已有环境变量）
+shared/           # 前后端共享 API 契约类型（#derive(ToJson, FromJson)）
+frontend/         # 监控前端：rabbita Elm 架构（js 目标），model/update/view + 单测
+web/index.html    # 监控页面 HTML 外壳（CSS + 挂载点）
+tools/            # build_web.mbtx：构建前端并生成内嵌资源（.mbtx 自动化脚本）
 cmd/main/         # 入口：load_env → 配置 → 任务组并发跑代理与监控两个服务器
 .env.example      # 用户配置模板（复制为 .env 使用）
 test/             # mock 上游（Node.js，端到端测试用）+ 监控页面截图

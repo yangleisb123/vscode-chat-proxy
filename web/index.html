@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>vscode-chat-proxy · 请求监控</title>
+<style>
+:root { color-scheme: dark; }
+* { box-sizing: border-box; }
+body { margin:0; font:13px/1.5 "Segoe UI","Microsoft YaHei",sans-serif; background:#1b1d23; color:#d6d9e0; height:100vh; display:flex; flex-direction:column; }
+header { display:flex; align-items:center; gap:10px; padding:8px 12px; background:#23262e; border-bottom:1px solid #333742; flex-wrap:wrap; }
+h1 { font-size:15px; margin:0; }
+h1 span { color:#8a90a0; font-weight:normal; font-size:12px; }
+#stats { color:#8a90a0; font-size:12px; }
+input, button { background:#2b2f38; color:#d6d9e0; border:1px solid #3a3f4b; border-radius:4px; padding:4px 8px; font-size:12px; }
+button { cursor:pointer; }
+button:hover { background:#343945; }
+button.on { background:#3d5a80; border-color:#5a7fa8; }
+#filter { min-width:180px; }
+main { flex:1; display:flex; min-height:0; }
+#list { flex:1.15; overflow:auto; border-right:1px solid #333742; min-width:0; }
+#detail { flex:1; overflow:auto; padding:10px 12px; min-width:0; }
+table.flows { width:100%; border-collapse:collapse; font-size:12px; }
+table.flows th { position:sticky; top:0; background:#23262e; text-align:left; padding:5px 8px; border-bottom:1px solid #333742; color:#8a90a0; font-weight:600; z-index:1; }
+table.flows td { padding:4px 8px; border-bottom:1px solid #262932; white-space:nowrap; }
+table.flows tr { cursor:pointer; }
+table.flows tr:hover { background:#262a33; }
+table.flows tr.sel { background:#2e3a4d; }
+td.path { max-width:340px; overflow:hidden; text-overflow:ellipsis; }
+td.st-good { color:#7ec699; }
+td.st-bad { color:#e06c75; }
+td.st-pending { color:#d19a66; }
+td.inj { color:#7ec699; }
+tr.err td { color:#e06c75; }
+.empty { color:#6b7280; padding:30px; text-align:center; }
+.dbar { display:flex; flex-direction:column; gap:2px; margin-bottom:8px; }
+.dbar .dtitle { font-weight:600; font-size:13px; word-break:break-all; }
+.dmeta { color:#8a90a0; font-size:11px; }
+.errbox { background:#3a2426; color:#e06c75; padding:6px 8px; border-radius:4px; margin-bottom:8px; }
+.tabs { display:flex; gap:6px; margin-bottom:8px; }
+.tabs button.on { background:#3d5a80; border-color:#5a7fa8; }
+.line { font-family:Consolas,monospace; background:#23262e; padding:5px 8px; border-radius:4px; margin-bottom:6px; word-break:break-all; }
+table.hdrs { width:100%; border-collapse:collapse; font-size:12px; margin-bottom:8px; }
+table.hdrs td { padding:2px 6px; border-bottom:1px solid #262932; vertical-align:top; }
+table.hdrs td.hk { color:#8a90a0; width:180px; word-break:break-all; }
+table.hdrs td.hv { word-break:break-all; }
+.bnote { color:#8a90a0; font-size:11px; margin:4px 0; }
+pre { background:#15171c; border:1px solid #2a2e37; border-radius:4px; padding:8px; overflow:auto; max-height:46vh; font:12px/1.5 Consolas,"Courier New",monospace; white-space:pre-wrap; word-break:break-all; margin:0; }
+@media (max-width:900px) { main { flex-direction:column; } #list { border-right:none; border-bottom:1px solid #333742; max-height:45%; } }
+</style>
+</head>
+<body>
+<div id="app"></div>
+<script src="/frontend.js"></script>
+</body>
+</html>

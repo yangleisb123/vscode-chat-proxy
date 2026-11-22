@@ -138,17 +138,6 @@ pub fn FlowStore::find(self : FlowStore, id : Int32) -> Flow? {
 }
 
 ///|
-fn headers_json(headers : Array[(String, String)]) -> Json {
-  Json::array(
-    [
-      for pair in headers => {
-        Json::array([Json::string(pair.0), Json::string(pair.1)])
-      }
-    ],
-  )
-}
-
-///|
 fn body_json(body : Bytes) -> String {
   @utf8.decode_lossy(body)
 }
@@ -173,95 +162,86 @@ fn content_type(headers : Array[(String, String)]) -> String {
 }
 
 ///|
-/// Summary row for the flow list API.
-pub fn Flow::summary_json(self : Flow) -> Json {
-  Json::object({
-    "id": Json::number(self.id.to_double()),
-    "start_ms": Json::number(self.start_ms.to_double()),
-    "method": Json::string(self.http_method),
-    "path": Json::string(self.target),
-    "status": Json::number(self.status.to_double()),
-    "reason": Json::string(self.reason),
-    "intercepted": Json::boolean(self.intercepted),
-    "injected": Json::boolean(self.injected),
-    "pending": Json::boolean(!self.finished),
-    "error": match self.error {
-      Some(e) => Json::string(e)
-      None => Json::null()
-    },
-    "req_size": Json::number(self.request_size.to_double()),
-    "resp_size": Json::number(self.response_size.to_double()),
-    "duration_ms": Json::number(duration_ms(self).to_double()),
-    "content_type": Json::string(content_type(self.response_headers)),
-  })
+/// Summary row for the flow list API (shared contract type).
+pub fn Flow::summary(self : Flow) -> @shared.FlowSummary {
+  {
+    id: self.id,
+    start_ms: self.start_ms.to_double(),
+    http_method: self.http_method,
+    path: self.target,
+    status: self.status,
+    reason: self.reason,
+    intercepted: self.intercepted,
+    injected: self.injected,
+    pending: !self.finished,
+    error: self.error,
+    req_size: self.request_size,
+    resp_size: self.response_size,
+    duration_ms: duration_ms(self),
+    content_type: content_type(self.response_headers),
+  }
 }
 
 ///|
-/// Full detail for the flow detail API.
-pub fn Flow::detail_json(self : Flow) -> Json {
-  let request = Json::object({
-    "method": Json::string(self.http_method),
-    "target": Json::string(self.target),
-    "headers": headers_json(self.request_headers),
-    "body": Json::string(body_json(self.request_body)),
-    "truncated": Json::boolean(self.request_truncated),
-    "size": Json::number(self.request_size.to_double()),
-  })
-  let upstream_request = match self.upstream_body {
-    Some(b) =>
-      Json::object({
-        "body": Json::string(body_json(b)),
-        "truncated": Json::boolean(self.upstream_truncated),
-      })
-    None => Json::null()
+/// Full detail for the flow detail API (shared contract type).
+pub fn Flow::detail(self : Flow) -> @shared.FlowDetail {
+  let request : @shared.RequestData = {
+    http_method: self.http_method,
+    target: self.target,
+    headers: self.request_headers,
+    body: body_json(self.request_body),
+    truncated: self.request_truncated,
+    size: self.request_size,
   }
-  let response = if self.status == 0 && self.error is None {
-    Json::null()
+  let upstream_request : @shared.UpstreamRequest? = match self.upstream_body {
+    Some(b) => Some({ body: body_json(b), truncated: self.upstream_truncated, })
+    None => None
+  }
+  let response : @shared.ResponseData? = if self.status == 0 &&
+    self.error is None {
+    None
   } else {
-    Json::object({
-      "status": Json::number(self.status.to_double()),
-      "reason": Json::string(self.reason),
-      "headers": headers_json(self.response_headers),
-      "body": Json::string(body_json(self.response_body)),
-      "truncated": Json::boolean(self.response_truncated),
-      "size": Json::number(self.response_size.to_double()),
+    Some({
+      status: self.status,
+      reason: self.reason,
+      headers: self.response_headers,
+      body: body_json(self.response_body),
+      truncated: self.response_truncated,
+      size: self.response_size,
     })
   }
-  Json::object({
-    "id": Json::number(self.id.to_double()),
-    "start_ms": Json::number(self.start_ms.to_double()),
-    "duration_ms": Json::number(duration_ms(self).to_double()),
-    "client_addr": Json::string(self.client_addr),
-    "upstream": Json::string(self.upstream),
-    "intercepted": Json::boolean(self.intercepted),
-    "injected": Json::boolean(self.injected),
-    "pending": Json::boolean(!self.finished),
-    "error": match self.error {
-      Some(e) => Json::string(e)
-      None => Json::null()
-    },
-    "request": request,
-    "upstream_request": upstream_request,
-    "response": response,
-  })
+  {
+    id: self.id,
+    start_ms: self.start_ms.to_double(),
+    duration_ms: duration_ms(self),
+    client_addr: self.client_addr,
+    upstream: self.upstream,
+    intercepted: self.intercepted,
+    injected: self.injected,
+    pending: !self.finished,
+    error: self.error,
+    request,
+    upstream_request,
+    response,
+  }
 }
 
 ///|
-/// Flow list API payload (newest first).
-pub fn FlowStore::list_json(self : FlowStore) -> Json {
-  let rows : Array[Json] = []
+/// Flow list API payload (newest first, shared contract type).
+pub fn FlowStore::list_response(self : FlowStore) -> @shared.FlowsResponse {
+  let rows : Array[@shared.FlowSummary] = []
   let mut i = self.flows.length() - 1
   while i >= 0 {
-    rows.push(self.flows[i].summary_json())
+    rows.push(self.flows[i].summary())
     i -= 1
   }
-  Json::object({
-    "total": Json::number(self.total.to_double()),
-    "injected_total": Json::number(self.injected_total.to_double()),
-    "stored": Json::number(self.flows.length().to_double()),
-    "capacity": Json::number(self.capacity.to_double()),
-    "flows": Json::array(rows),
-  })
+  {
+    total: self.total,
+    injected_total: self.injected_total,
+    stored: self.flows.length(),
+    capacity: self.capacity,
+    flows: rows,
+  }
 }
 
 ///|

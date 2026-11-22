@@ -62,7 +62,7 @@ test "flow: decode_chunked_body" {
 }
 
 ///|
-test "flow: list and detail json" {
+test "flow: list and detail via shared contract" {
   let store = FlowStore::new()
   let f = begin_test_flow(store, "/v1/chat/completions")
   f.injected = true
@@ -73,56 +73,35 @@ test "flow: list and detail json" {
   f.response_body = @utf8.encode("{\"ok\":true}")
   f.response_size = 11
   store.finish(f)
-  match store.list_json() {
-    Object(obj) => {
-      assert_true(obj.get("total") is Some(_))
-      match obj.get("flows") {
-        Some(Array(rows)) => {
-          assert_eq(rows.length(), 1)
-          match rows[0] {
-            Object(row) => {
-              assert_true(row.get("injected") is Some(True))
-              assert_true(
-                row.get("path") is Some(String("/v1/chat/completions")),
-              )
-              assert_true(row.get("pending") is Some(False))
-            }
-            _ => abort("expected row object")
-          }
-        }
-        _ => abort("expected flows array")
-      }
-    }
-    _ => abort("expected list object")
-  }
-  match f.detail_json() {
-    Object(d) => {
-      assert_true(d.get("upstream_request") is Some(Object(_)))
-      match d.get("request") {
-        Some(Object(req)) => assert_true(req.get("body") is Some(String("{}")))
-        _ => abort("expected request object")
-      }
-      match d.get("response") {
-        Some(Object(resp)) => {
-          assert_true(resp.get("status") is Some(Number(_, ..)))
-          assert_true(resp.get("body") is Some(String("{\"ok\":true}")))
-        }
-        _ => abort("expected response object")
-      }
-    }
-    _ => abort("expected detail object")
-  }
+  let list = store.list_response()
+  assert_eq(list.total, 1)
+  assert_eq(list.injected_total, 1)
+  assert_eq(list.flows.length(), 1)
+  assert_eq(list.flows[0].injected, true)
+  assert_eq(list.flows[0].path, "/v1/chat/completions")
+  assert_eq(list.flows[0].pending, false)
+  assert_eq(list.flows[0].content_type, "application/json")
+  // The shared type must survive a JSON round-trip (wire format).
+  let list2 : @shared.FlowsResponse = @json.from_json(
+    @json.parse(list.to_json().stringify()),
+  )
+  assert_eq(list2, list)
+  let d = f.detail()
+  assert_true(d.upstream_request is Some(_))
+  assert_eq(d.request.body, "{}")
+  assert_eq(d.response.unwrap().status, 200)
+  assert_eq(d.response.unwrap().body, "{\"ok\":true}")
+  let d2 : @shared.FlowDetail = @json.from_json(
+    @json.parse(d.to_json().stringify()),
+  )
+  assert_eq(d2, d)
 }
 
 ///|
 test "flow: pending flow has null response in detail" {
   let store = FlowStore::new()
   let f = begin_test_flow(store, "/x")
-  match f.detail_json() {
-    Object(d) => {
-      assert_true(d.get("response") is Some(Null))
-      assert_true(d.get("pending") is Some(True))
-    }
-    _ => abort("expected detail object")
-  }
+  let d = f.detail()
+  assert_true(d.response is None)
+  assert_true(d.pending)
 }
