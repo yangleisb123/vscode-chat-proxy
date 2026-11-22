@@ -2,9 +2,11 @@
 
 一个用 **MoonBit** 编写的本地 HTTP 反向代理：监听本地端口，把请求转发给上游 API 服务器，
 并拦截所有 **URL 以 `/v1/chat/completions` 结尾的 POST 请求**（标准 Chat Completions API），
-确保其 System message 的第一句是：
+确保其 System message 的第一句是**配置里指定的话术**——默认是：
 
 > 你是一个AI助手，工作在 vscode 环境中
+
+这句话不是写死的：改 `.env` 里的 `SYSTEM_PROMPT`（或启动参数 `--system-prompt`）就能换成任意话术。
 
 支持 **Windows** 和 **Linux**（macOS 也可以）。基于官方 [`moonbitlang/async`](https://github.com/moonbitlang/async)
 异步运行时（Linux epoll / Windows IOCP），单进程即可并发处理多个连接，**SSE 流式响应实时透传**。
@@ -31,15 +33,19 @@
 
 ## 拦截规则
 
-对 `POST */v1/chat/completions`（忽略 query string，支持路径带前缀如 `/openai/v1/chat/completions`）：
+对 `POST */v1/chat/completions`（忽略 query string，支持路径带前缀如 `/openai/v1/chat/completions`）。
+下表的「配置话术」指 `.env` 里 `SYSTEM_PROMPT` 的值，默认 `你是一个AI助手，工作在 vscode 环境中`：
 
 | 请求体情况 | 处理 |
 |---|---|
-| 第一条 `role:"system"` 消息的内容**以这句话开头**（允许前导空白，后面可接其他内容） | 原样放行 |
-| 有 system 消息但开头不是这句话 | 在该内容**最前面**加上 `你是一个AI助手，工作在 vscode 环境中。` + 换行，其余内容保留 |
-| 没有任何 system 消息 | 在 `messages` 数组**最前面插入**一条 `{"role":"system","content":"你是一个AI助手，工作在 vscode 环境中。"}` |
+| 第一条 `role:"system"` 消息的内容**以配置话术开头**（允许前导空白，后面可接其他内容） | 原样放行 |
+| 有 system 消息但开头不是配置话术 | 在该内容**最前面**加上 `配置话术 + 句号` + 换行，其余内容保留 |
+| 没有任何 system 消息 | 在 `messages` 数组**最前面插入**一条 `{"role":"system","content":"<配置话术>。"}` |
 | system 的 content 是多模态数组（`[{type:"text",...},...]`） | 检查/改写第一个 `text` 片段；没有 text 片段则插入一个 |
 | 请求体不是合法 JSON | 原样转发（日志给出警告） |
+
+> 句号的处理：配置话术若已以 `。．！？；：…` 或 `.!?;:` 结尾就不再追加；否则
+> 以 ASCII 结尾的补 `.`，以中文结尾的补 `。`。配置话术为空/纯空白时回退到默认那句。
 
 其他请求（GET、其他路径、其他方法）**全部原样透传**，不做任何修改。
 
@@ -56,7 +62,7 @@ cd vscode-chat-proxy
 
 # 1. 创建用户配置（参考 moonbit_claude_proxy 的 .env 模式）
 cp .env.example .env        # Windows PowerShell: Copy-Item .env.example .env
-# 按需编辑 .env 里的 HOST / PORT / UPSTREAM_HOST / UPSTREAM_PORT
+# 按需编辑 .env 里的 HOST / PORT / UPSTREAM_HOST / UPSTREAM_PORT / SYSTEM_PROMPT
 
 # 2. 运行（默认 wasm 目标，Windows / Linux 都开箱即用，自动读取 .env）
 moon run cmd/main
@@ -71,6 +77,7 @@ moon run cmd/main -- --listen 127.0.0.1:8787 --upstream 127.0.0.1:8080
 - `--listen` / `-l`：本地监听地址，默认 `127.0.0.1:8787`
 - `--upstream` / `-u`：上游 HTTP API 服务器地址，默认 `127.0.0.1:8080`
 - `--web` / `-w`：监控页面地址，默认 `127.0.0.1:8788`（`--web off` 或 `--no-web` 关闭）
+- `--system-prompt` / `-s`（别名 `--prompt`）：注入的 system 第一句，默认 `你是一个AI助手，工作在 vscode 环境中`
 - `--help` 查看帮助
 
 然后把客户端（VSCode 插件、CLI 等）的 API Base URL 指向代理，例如：
@@ -96,6 +103,7 @@ moon run cmd/main -- --listen 127.0.0.1:8787 --upstream 127.0.0.1:8080
 | `UPSTREAM_PORT` | 上游 API 端口（明文 HTTP） | `8080` |
 | `WEB_HOST` | 监控页面主机 | `127.0.0.1` |
 | `WEB_PORT` | 监控页面端口 | `8788` |
+| `SYSTEM_PROMPT` | 注入到 system 消息第一句的话术（`VSCODE_CHAT_PROXY_SYSTEM_PROMPT` 是等价别名；空白值回退默认） | `你是一个AI助手，工作在 vscode 环境中` |
 | `VSCODE_CHAT_PROXY_LISTEN` | 组合写法 `host:port`，优先于 `HOST`/`PORT` | 未设置 |
 | `VSCODE_CHAT_PROXY_UPSTREAM` | 组合写法 `host:port`（支持 `[ipv6]:port`），优先于 `UPSTREAM_HOST`/`UPSTREAM_PORT` | 未设置 |
 
@@ -106,6 +114,9 @@ moon run cmd/main -- --listen 127.0.0.1:8787 --upstream 127.0.0.1:8080
 ```bash
 # 上游是你的 API 网关（one-api / sub2api / new-api 等），监听 8080
 moon run cmd/main -- -l 127.0.0.1:8787 -u 127.0.0.1:8080
+
+# 用命令行临时换一句注入话术（等价于 .env 里写 SYSTEM_PROMPT=...）
+moon run cmd/main -- -l 127.0.0.1:8787 -u 127.0.0.1:8080 -s "你是代码审阅助手"
 
 # 测试：没有 system 消息的请求会被自动插入
 curl http://127.0.0.1:8787/v1/chat/completions \
@@ -188,7 +199,7 @@ moon test frontend --target js  # 前端 update 逻辑单测
 ## 测试
 
 ```bash
-moon test                 # 41 个后端/契约单元测试（默认 wasm 目标）
+moon test                 # 50 个后端/契约单元测试（默认 wasm 目标）
 moon test --target native # Linux / 有 MSVC 的 Windows
 moon test frontend --target js  # 7 个前端 Elm update 逻辑测试
 moon check --target all   # 全目标类型检查
@@ -201,6 +212,7 @@ moon run cmd/main -- -l 127.0.0.1:18787 -u 127.0.0.1:18080
 
 已验证场景（Windows wasm 与 Linux native 双平台）：
 无 system 插入、已有前缀放行、其他 system 文本前置注入、多模态 content、
+自定义 `SYSTEM_PROMPT` / `--system-prompt` 话术（含英文话术与自带句末标点）、
 SSE 流式透传、chunked 请求体、GET/其他路径透传、`Authorization` 等头部保留、
 `.env` 加载与「命令行 > 环境变量 > .env」优先级、
 监控页面列表/详情/注入对比/SSE 出参捕获（浏览器实测）。

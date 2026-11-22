@@ -92,7 +92,7 @@ async fn handle_connection_inner(
     if body.length() > 0 {
       try {
         let json = @json.parse(@utf8.decode(body))
-        if ensure_system_prefix(json) {
+        if ensure_system_prefix_with(json, cfg.system_prompt) {
           out_body = @utf8.encode(json.stringify())
           flow.injected = true
           let (capped, truncated) = @monitor.cap_bytes(out_body)

@@ -11,6 +11,8 @@ import {
 // Values
 pub fn ensure_system_prefix(@json.Json) -> Bool
 
+pub fn ensure_system_prefix_with(@json.Json, String) -> Bool
+
 pub async fn handle_connection(@socket.Tcp, @config.Config, @monitor.FlowStore, String) -> Unit
 
 pub let required_prefix : String

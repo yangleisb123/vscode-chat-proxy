@@ -133,3 +133,66 @@ test "prefix: bodies without messages are untouched" {
   let body3 = fixture("[1,2,3]")
   assert_true(!@proxy.ensure_system_prefix(body3))
 }
+
+///|
+test "custom prefix: injected when no system message" {
+  let body = fixture(
+    "{'model':'m','messages':[{'role':'user','content':'hi'}]}",
+  )
+  assert_true(
+    @proxy.ensure_system_prefix_with(body, "你是代码审阅助手"),
+  )
+  let expected = fixture(
+    "{'model':'m','messages':[{'role':'system','content':'你是代码审阅助手。'},{'role':'user','content':'hi'}]}",
+  )
+  assert_true(body == expected)
+}
+
+///|
+test "custom prefix: already present passes through" {
+  let src = "{'messages':[{'role':'system','content':'  你是代码审阅助手。请简洁回答。'},{'role':'user','content':'hi'}]}"
+  let body = fixture(src)
+  assert_true(
+    !@proxy.ensure_system_prefix_with(body, "你是代码审阅助手"),
+  )
+  assert_true(body == fixture(src))
+}
+
+///|
+test "custom prefix: other system text gets it prepended" {
+  let body = fixture(
+    "{'messages':[{'role':'system','content':'You are helpful.'},{'role':'user','content':'hi'}]}",
+  )
+  assert_true(
+    @proxy.ensure_system_prefix_with(body, "You are an AI assistant in VSCode"),
+  )
+  assert_eq(
+    content_of_first_message(body),
+    Some("You are an AI assistant in VSCode.\nYou are helpful."),
+  )
+}
+
+///|
+test "custom prefix: trailing punctuation is not doubled" {
+  let body = fixture("{'messages':[{'role':'user','content':'hi'}]}")
+  assert_true(
+    @proxy.ensure_system_prefix_with(body, "You are a helpful assistant."),
+  )
+  assert_eq(
+    content_of_first_message(body),
+    Some("You are a helpful assistant."),
+  )
+  let body2 = fixture("{'messages':[{'role':'user','content':'hi'}]}")
+  assert_true(@proxy.ensure_system_prefix_with(body2, "请用中文回答！"))
+  assert_eq(content_of_first_message(body2), Some("请用中文回答！"))
+}
+
+///|
+test "custom prefix: blank falls back to the built-in sentence" {
+  let body = fixture("{'messages':[{'role':'user','content':'hi'}]}")
+  assert_true(@proxy.ensure_system_prefix_with(body, "   "))
+  assert_eq(
+    content_of_first_message(body),
+    Some("你是一个AI助手，工作在 vscode 环境中。"),
+  )
+}

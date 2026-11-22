@@ -52,6 +52,7 @@ async fn main {
         ":" +
         cfg.upstream_port.to_string(),
       )
+      println("[proxy] system prompt: \"" + cfg.system_prompt + "\"")
       println("[proxy] intercepting POST */v1/chat/completions")
       server.run_forever((conn, peer) => {
         @proxy.handle_connection(conn, cfg, store, peer.to_string())
@@ -70,13 +71,15 @@ fn usage() -> String {
   "Usage: vscode-chat-proxy [options]\n" +
   "\n" +
   "A local HTTP proxy that ensures the system message of Chat Completions\n" +
-  "requests starts with the required VSCode AI-assistant sentence.\n" +
+  "requests starts with the configured VSCode AI-assistant sentence.\n" +
   "\n" +
   "Options:\n" +
   "  -l, --listen <host:port>    Local address to listen on (default 127.0.0.1:8787)\n" +
   "  -u, --upstream <host:port>  Upstream HTTP API server (default 127.0.0.1:8080)\n" +
   "  -w, --web <host:port|off>   Monitor web UI address (default 127.0.0.1:8788)\n" +
   "      --no-web                Disable the monitor web UI\n" +
+  "  -s, --system-prompt <text>  Sentence forced to open the system message\n" +
+  "                              (alias --prompt; default: \"你是一个AI助手，工作在 vscode 环境中\")\n" +
   "  -h, --help                  Show this help\n" +
   "\n" +
   "Configuration precedence: CLI flags > environment variables > .env > defaults.\n" +
@@ -86,6 +89,7 @@ fn usage() -> String {
   "  HOST / PORT                 Listen address (default 127.0.0.1 / 8787)\n" +
   "  UPSTREAM_HOST / UPSTREAM_PORT  Upstream address (default 127.0.0.1 / 8080)\n" +
   "  WEB_HOST / WEB_PORT         Monitor UI address (default 127.0.0.1 / 8788)\n" +
+  "  SYSTEM_PROMPT               Sentence forced to open the system message\n" +
   "  VSCODE_CHAT_PROXY_LISTEN    Combined host:port, overrides HOST/PORT\n" +
   "  VSCODE_CHAT_PROXY_UPSTREAM  Combined host:port, overrides UPSTREAM_HOST/UPSTREAM_PORT\n"
 }

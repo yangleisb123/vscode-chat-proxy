@@ -63,3 +63,26 @@ test "config: web options" {
   assert_true(cfg4.web_enabled)
   assert_eq(cfg4.web_port, 8788)
 }
+
+///|
+test "config: system prompt option" {
+  assert_eq(default_config().system_prompt, default_system_prompt)
+  let cfg = parse_config(
+    ["prog", "--system-prompt", "你是代码审阅助手"],
+    default_config(),
+  ).unwrap()
+  assert_eq(cfg.system_prompt, "你是代码审阅助手")
+  let cfg2 = parse_config(
+    ["prog", "--prompt=You are a helpful assistant"],
+    default_config(),
+  ).unwrap()
+  assert_eq(cfg2.system_prompt, "You are a helpful assistant")
+  let cfg3 = parse_config(["prog", "-s", " 自定义话术 "], default_config()).unwrap()
+  assert_eq(cfg3.system_prompt, "自定义话术")
+  assert_true(
+    parse_config(["prog", "--system-prompt"], default_config()) is Err(_),
+  )
+  assert_true(
+    parse_config(["prog", "--system-prompt", "   "], default_config()) is Err(_),
+  )
+}

@@ -14,7 +14,11 @@ pub fn config_from_env() -> @config.Config
 
 pub fn default_config() -> @config.Config
 
+pub let default_system_prompt : String
+
 pub fn ensure_system_prefix(@json.Json) -> Bool
+
+pub fn ensure_system_prefix_with(@json.Json, String) -> Bool
 
 pub async fn handle_connection(@socket.Tcp, @config.Config, @monitor.FlowStore, String) -> Unit
 

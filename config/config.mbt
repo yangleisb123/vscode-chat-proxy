@@ -1,4 +1,9 @@
 ///|
+/// The sentence forced to be the first sentence of the Chat Completions
+/// system message unless overridden by `SYSTEM_PROMPT` / `--system-prompt`.
+pub let default_system_prompt : String = "你是一个AI助手，工作在 vscode 环境中"
+
+///|
 pub(all) struct Config {
   listen_host : String
   listen_port : Int32
@@ -7,6 +12,8 @@ pub(all) struct Config {
   web_enabled : Bool
   web_host : String
   web_port : Int32
+  /// Sentence forced to open the first `system` message.
+  system_prompt : String
 }
 
 ///|
@@ -24,7 +31,36 @@ pub fn default_config() -> Config {
     web_enabled: true,
     web_host: "127.0.0.1",
     web_port: 8788,
+    system_prompt: default_system_prompt,
   }
+}
+
+///|
+/// Trim a user-supplied prompt; blank input means "keep the default".
+fn normalize_prompt(raw : String) -> String? {
+  let v = raw.clamped_view().trim()
+  if v.is_empty() {
+    None
+  } else {
+    Some(v.to_owned())
+  }
+}
+
+///|
+/// Read the configurable system prompt from `SYSTEM_PROMPT` (preferred) or
+/// `VSCODE_CHAT_PROXY_SYSTEM_PROMPT`, falling back to `default`.
+fn system_prompt_from_env(default : String) -> String {
+  for name in ["SYSTEM_PROMPT", "VSCODE_CHAT_PROXY_SYSTEM_PROMPT"] {
+    match @env.get_env_var(name) {
+      Some(raw) =>
+        match normalize_prompt(raw) {
+          Some(prompt) => return prompt
+          None => ()
+        }
+      None => ()
+    }
+  }
+  default
 }
 
 ///|
@@ -49,7 +85,9 @@ fn parse_env_port(name : String, default : Int32) -> Int32 {
 ///|
 /// Build the base config from environment variables (call after `load_env`).
 ///
-/// Individual variables: `HOST`, `PORT`, `UPSTREAM_HOST`, `UPSTREAM_PORT`.
+/// Individual variables: `HOST`, `PORT`, `UPSTREAM_HOST`, `UPSTREAM_PORT`,
+/// `WEB_HOST`, `WEB_PORT`, and `SYSTEM_PROMPT` (the sentence forced to open
+/// the `system` message).
 /// Combined `host:port` variables `VSCODE_CHAT_PROXY_LISTEN` /
 /// `VSCODE_CHAT_PROXY_UPSTREAM` take precedence over the individual ones.
 pub fn config_from_env() -> Config {
@@ -88,6 +126,7 @@ pub fn config_from_env() -> Config {
     _ => ()
   }
   cfg = { ..cfg, web_port: parse_env_port("WEB_PORT", cfg.web_port), }
+  cfg = { ..cfg, system_prompt: system_prompt_from_env(cfg.system_prompt), }
   cfg
 }
 
@@ -198,6 +237,11 @@ fn parse_config_exn(
         } else {
           let (h, p) = split_host_port(value)
           cfg = { ..cfg, web_enabled: true, web_host: h, web_port: p, }
+        }
+      "--system-prompt" | "--prompt" | "-s" =>
+        match normalize_prompt(value) {
+          Some(prompt) => cfg = { ..cfg, system_prompt: prompt, }
+          None => raise ConfigError("empty value for " + name)
         }
       _ => raise ConfigError("unknown option: " + name)
     }

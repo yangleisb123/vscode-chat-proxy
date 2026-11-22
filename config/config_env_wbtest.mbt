@@ -56,3 +56,31 @@ test "config: web env vars" {
   assert_eq(cfg.web_host, "0.0.0.0")
   assert_eq(cfg.web_port, 9090)
 }
+
+///|
+test "config: system prompt default and env override" {
+  @env.unset_env_var("SYSTEM_PROMPT")
+  @env.unset_env_var("VSCODE_CHAT_PROXY_SYSTEM_PROMPT")
+  let base = config_from_env()
+  assert_eq(base.system_prompt, default_system_prompt)
+  @env.set_env_var("SYSTEM_PROMPT", " 你是代码审阅助手 ")
+  defer @env.unset_env_var("SYSTEM_PROMPT")
+  let cfg = config_from_env()
+  assert_eq(cfg.system_prompt, "你是代码审阅助手")
+}
+
+///|
+test "config: system prompt combined alias" {
+  @env.unset_env_var("SYSTEM_PROMPT")
+  @env.set_env_var("VSCODE_CHAT_PROXY_SYSTEM_PROMPT", "alias 生效")
+  defer @env.unset_env_var("VSCODE_CHAT_PROXY_SYSTEM_PROMPT")
+  assert_eq(config_from_env().system_prompt, "alias 生效")
+}
+
+///|
+test "config: blank system prompt keeps the default" {
+  @env.unset_env_var("VSCODE_CHAT_PROXY_SYSTEM_PROMPT")
+  @env.set_env_var("SYSTEM_PROMPT", "   ")
+  defer @env.unset_env_var("SYSTEM_PROMPT")
+  assert_eq(config_from_env().system_prompt, default_system_prompt)
+}

@@ -6,6 +6,8 @@ pub fn config_from_env() -> Config
 
 pub fn default_config() -> Config
 
+pub let default_system_prompt : String
+
 pub fn parse_address(String) -> Result[(String, Int32), String]
 
 pub fn parse_config(Array[String], Config) -> Result[Config, String]
@@ -26,6 +28,7 @@ pub(all) struct Config {
   web_enabled : Bool
   web_host : String
   web_port : Int32
+  system_prompt : String
 }
 
 // Type aliases

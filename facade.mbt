@@ -3,6 +3,7 @@
 /// the implementation lives in layered sub-packages.
 pub using @proxy_impl {
   ensure_system_prefix,
+  ensure_system_prefix_with,
   required_prefix,
   handle_connection,
   type ProxyError,
@@ -12,6 +13,7 @@ pub using @proxy_impl {
 pub using @config_impl {
   type Config,
   type ConfigError,
+  default_system_prompt,
   default_config,
   config_from_env,
   parse_config,
