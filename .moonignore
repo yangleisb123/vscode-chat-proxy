@@ -1,0 +1,11 @@
+# Publishing rules (replace .gitignore for moon package/publish archives)
+.DS_Store
+_build/
+target/
+target
+.mooncakes/
+.moonagent/
+.env
+
+# Keep the config template in the published package (dotfiles are excluded by default)
+!/.env.example
