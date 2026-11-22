@@ -151,8 +151,16 @@ curl http://127.0.0.1:8787/v1/chat/completions \
   - **响应（出参）**：状态行、全部响应头、响应体；**SSE 流式响应完整捕获并自动去除 chunked 分块 framing**；
   - **注入后转发体**：被注入前缀的请求额外提供此页签，对比实际发给上游的 body。
 - 进行中的请求（如正在输出的 SSE）实时显示为「进行中」，完成后自动补全出参。
-- 内存环形缓存最近 **200** 条；每个 body 最多保存 **256 KiB**（超出截断并标注）。
-  重启即清空，不落盘。
+- 数据落在**系统临时目录**里（每个 flow 一个 JSON 文件，文件名是补零的 id）：
+  - Windows：`%TEMP%\vscode-chat-proxy-monitor-<WEB_PORT>\`
+  - macOS / Linux：`$TMPDIR`（未设置时 `/tmp`）`/vscode-chat-proxy-monitor-<WEB_PORT>/`
+  - 可用 `MONITOR_DIR`（或 `VSCODE_CHAT_PROXY_MONITOR_DIR`）覆盖；启动日志会打印实际目录。
+- 最多保留最近 **200** 条；每个 body 最多保存 **256 KiB**（超出截断并标注）。
+  **重启后自动加载历史**，不再清空；超过 200 条时删除最旧的文件。
+- 目录清理由系统临时目录策略负责（Windows 的 `%TEMP%` 不保证自动清理，可用「存储感知」/
+  磁盘清理；Linux 的 `/tmp` 通常由 systemd-tmpfiles 或重启清理），也可随时手动删除或点「清空」。
+- 数据文件按 `0600` 创建（Windows 忽略权限位），但临时目录里的内容仍可能含 API Key。
+- `--no-web`（或 `--web off`）不启用监控页面，也不落盘，只在内存里保留最近 200 条。
 
 JSON API（页面即基于此实现，可自行脚本化）：
 
@@ -162,7 +170,7 @@ JSON API（页面即基于此实现，可自行脚本化）：
 | `GET /frontend.js` | MoonBit 前端构建产物（内嵌） |
 | `GET /api/flows` | 请求列表 + 统计（total / injected_total / stored / capacity） |
 | `GET /api/flows/<id>` | 单条详情（请求头/体、注入后 body、响应头/体） |
-| `DELETE /api/flows` | 清空缓存 |
+| `DELETE /api/flows` | 清空列表并删除已落盘的数据文件 |
 
 JSON 契约见 `shared/types.mbt`；可选字段（`error` / `upstream_request` / `response`）
 为 None 时**省略键**，Some 时直接是值（MoonBit derive 的 Option 编码约定）。
@@ -208,7 +216,7 @@ moon test frontend --target js  # 前端 update 逻辑单测
 ## 测试
 
 ```bash
-moon test                 # 50 个后端/契约单元测试（默认 wasm 目标）
+moon test                 # 51 个后端/契约单元测试（默认 wasm 目标）
 moon test --target native # Linux / 有 MSVC 的 Windows
 moon test frontend --target js  # 7 个前端 Elm update 逻辑测试
 moon check --target all   # 全目标类型检查
@@ -235,7 +243,7 @@ SSE 流式透传、chunked 请求体、GET/其他路径透传、`Authorization` 
 moon.pkg / facade.mbt   # 根 facade：pub using 再导出各层公共 API（旧导入路径兼容）
 shared/                 # 前后端共享 API 契约类型（#derive(ToJson, FromJson)）
 proxy/                  # 代理核心：system 前缀注入 + 连接处理/转发/捕获
-monitor/                # 监控层：Flow/FlowStore 环形缓存、chunked 解码、
+monitor/                # 监控层：Flow/FlowStore（临时目录 JSON 持久化）、chunked 解码、
                         #   moonback Web 服务器与 JSON API、内嵌资源 web_assets.mbt
 config/                 # 配置层：Config、命令行/环境变量解析
 internal/httpparse/     # 实现支持：代理数据面的 HTTP 解析/请求头重建
@@ -262,5 +270,5 @@ test/                   # mock 上游（Node.js）+ 监控页面截图
 - 每个连接只处理一个请求（`Connection: close`）；对 API 调用场景无实际影响。
 - 请求体缓冲上限 64 MiB。
 - 只检查**第一条** system 消息；`developer` role 不视为 system。
-- 监控数据仅存内存（最近 200 条、每 body 256 KiB），重启清空；
-  被代理拒绝的请求（CONNECT/Upgrade/坏请求行）不进监控列表。
+- 监控数据存系统临时目录（最近 200 条、每 body 256 KiB），重启后自动加载；
+  临时目录被系统清理时历史会丢失。被代理拒绝的请求（CONNECT/Upgrade/坏请求行）不进监控列表。

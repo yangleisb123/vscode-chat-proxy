@@ -38,8 +38,8 @@ pub async fn run_web_server(
             return
           }
         }
-        match store.find(id) {
-          Some(flow) => res.send_json(flow.detail().to_json())
+        match store.detail(id) {
+          Some(detail) => res.send_json(detail.to_json())
           None => res.send_text("flow not found", status=404)
         }
       })

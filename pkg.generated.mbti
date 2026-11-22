@@ -14,6 +14,8 @@ pub fn config_from_env() -> @config.Config
 
 pub fn default_config() -> @config.Config
 
+pub fn default_store_dir(port~ : Int32) -> String
+
 pub let default_system_prompt : String
 
 pub fn ensure_system_prefix(@json.Json) -> Bool

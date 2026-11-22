@@ -19,7 +19,21 @@ async fn main {
       @env.exit(1)
     }
   }
-  let store = @proxy.FlowStore::new()
+  // Monitor flows live in the system temp directory so they survive proxy
+  // restarts; `--no-web` keeps the historical memory-only behaviour.
+  let store = if cfg.web_enabled {
+    let dir = @proxy.default_store_dir(port=cfg.web_port)
+    let store = @proxy.FlowStore::open(dir)
+    let actual = store.data_dir()
+    if actual.is_empty() {
+      println("[monitor] cannot use " + dir + ", falling back to memory")
+    } else {
+      println("[monitor] data dir: " + actual)
+    }
+    store
+  } else {
+    @proxy.FlowStore::new()
+  }
   try
     @async.with_task_group() <| group => {
       // Monitor web UI (mitmweb style). Its failure must not kill the proxy.
@@ -89,6 +103,8 @@ fn usage() -> String {
   "  HOST / PORT                 Listen address (default 127.0.0.1 / 8787)\n" +
   "  UPSTREAM_HOST / UPSTREAM_PORT  Upstream address (default 127.0.0.1 / 8080)\n" +
   "  WEB_HOST / WEB_PORT         Monitor UI address (default 127.0.0.1 / 8788)\n" +
+  "  MONITOR_DIR                 Monitor data directory (default: system temp\n" +
+  "                              directory / vscode-chat-proxy-monitor-<WEB_PORT>)\n" +
   "  SYSTEM_PROMPT               Sentence forced to open the system message\n" +
   "  VSCODE_CHAT_PROXY_LISTEN    Combined host:port, overrides HOST/PORT\n" +
   "  VSCODE_CHAT_PROXY_UPSTREAM  Combined host:port, overrides UPSTREAM_HOST/UPSTREAM_PORT\n"

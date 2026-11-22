@@ -22,7 +22,12 @@ pub using @config_impl {
 }
 
 ///|
-pub using @monitor_impl {type Flow, type FlowStore, run_web_server}
+pub using @monitor_impl {
+  type Flow,
+  type FlowStore,
+  default_store_dir,
+  run_web_server,
+}
 
 ///|
 pub using @dotenv_impl {load_env}

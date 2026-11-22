@@ -12,6 +12,8 @@ pub fn cap_bytes(Bytes) -> (Bytes, Bool)
 
 pub fn decode_chunked_body(Bytes) -> Bytes
 
+pub fn default_store_dir(port~ : Int32) -> String
+
 pub async fn run_web_server(String, Int32, FlowStore) -> Unit
 
 // Errors
@@ -27,7 +29,7 @@ pub(all) struct Flow {
   request_size : Int32
   intercepted : Bool
   upstream : String
-  request_body : Bytes
+  mut request_body : Bytes
   request_truncated : Bool
   mut injected : Bool
   mut upstream_body : Bytes?
@@ -41,23 +43,28 @@ pub(all) struct Flow {
   mut end_ms : UInt64
   mut error : String?
   mut finished : Bool
+  mut persisted : Bool
 }
 pub fn Flow::detail(Self) -> @shared.FlowDetail
 pub fn Flow::summary(Self) -> @shared.FlowSummary
 
 pub struct FlowStore {
+  dir : String
   capacity : Int32
   mut flows : Array[Flow]
   mut next_id : Int32
   mut total : Int32
   mut injected_total : Int32
 }
-pub fn FlowStore::begin(Self, client_addr~ : String, http_method~ : String, target~ : String, request_headers~ : Array[(String, String)], request_body~ : Bytes, intercepted~ : Bool, upstream~ : String) -> Flow
-pub fn FlowStore::clear(Self) -> Unit
+pub async fn FlowStore::begin(Self, client_addr~ : String, http_method~ : String, target~ : String, request_headers~ : Array[(String, String)], request_body~ : Bytes, intercepted~ : Bool, upstream~ : String) -> Flow
+pub async fn FlowStore::clear(Self) -> Unit
+pub fn FlowStore::data_dir(Self) -> String
+pub async fn FlowStore::detail(Self, Int32) -> @shared.FlowDetail?
 pub fn FlowStore::find(Self, Int32) -> Flow?
-pub fn FlowStore::finish(Self, Flow) -> Unit
+pub async fn FlowStore::finish(Self, Flow) -> Unit
 pub fn FlowStore::list_response(Self) -> @shared.FlowsResponse
 pub fn FlowStore::new(capacity? : Int32) -> Self
+pub async fn FlowStore::open(String, capacity? : Int32) -> Self
 
 // Type aliases
 

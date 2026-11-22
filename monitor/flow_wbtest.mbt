@@ -1,5 +1,5 @@
 ///|
-fn begin_test_flow(store : FlowStore, target : String) -> Flow {
+async fn begin_test_flow(store : FlowStore, target : String) -> Flow {
   store.begin(
     client_addr="127.0.0.1:1",
     http_method="POST",
@@ -12,7 +12,7 @@ fn begin_test_flow(store : FlowStore, target : String) -> Flow {
 }
 
 ///|
-test "flow: begin / finish / find / clear" {
+async test "flow: begin / finish / find / clear" {
   let store = FlowStore::new(capacity=2)
   let f1 = begin_test_flow(store, "/a")
   assert_eq(f1.id, 1)
@@ -62,7 +62,7 @@ test "flow: decode_chunked_body" {
 }
 
 ///|
-test "flow: list and detail via shared contract" {
+async test "flow: list and detail via shared contract" {
   let store = FlowStore::new()
   let f = begin_test_flow(store, "/v1/chat/completions")
   f.injected = true
@@ -98,10 +98,52 @@ test "flow: list and detail via shared contract" {
 }
 
 ///|
-test "flow: pending flow has null response in detail" {
+async test "flow: pending flow has null response in detail" {
   let store = FlowStore::new()
   let f = begin_test_flow(store, "/x")
   let d = f.detail()
   assert_true(d.response is None)
   assert_true(d.pending)
+}
+
+///|
+async test "flow: persists to temp dir, reloads on restart, evicts and clears" {
+  let dir = @fs.tmpdir(prefix="vscode-chat-proxy-test")
+  let store = FlowStore::open(dir, capacity=2)
+  assert_eq(store.data_dir(), dir)
+  let f1 = begin_test_flow(store, "/one")
+  f1.status = 200
+  f1.reason = "OK"
+  f1.response_headers = [("Content-Type", "application/json")]
+  f1.response_body = @utf8.encode("{\"ok\":1}")
+  f1.response_size = 8
+  store.finish(f1)
+  let path1 = store.flow_path(f1.id)
+  assert_true(@fs.exists(path1))
+  // Bodies are released from memory, but the detail API reads them back.
+  assert_eq(f1.response_body.length(), 0)
+  let d1 = store.detail(f1.id).unwrap()
+  assert_eq(d1.response.unwrap().body, "{\"ok\":1}")
+
+  // Simulate a proxy restart: a new store loads the same directory.
+  let store2 = FlowStore::open(dir, capacity=2)
+  assert_eq(store2.list_response().stored, 1)
+  assert_eq(store2.list_response().flows[0].path, "/one")
+  let d2 = store2.detail(f1.id).unwrap()
+  assert_eq(d2.response.unwrap().body, "{\"ok\":1}")
+
+  // Capacity 2: a third finished flow evicts the oldest file.
+  let f2 = begin_test_flow(store2, "/two")
+  store2.finish(f2)
+  let f3 = begin_test_flow(store2, "/three")
+  store2.finish(f3)
+  assert_eq(store2.list_response().stored, 2)
+  assert_true(!@fs.exists(path1))
+  assert_true(@fs.exists(store2.flow_path(f2.id)))
+
+  store2.clear()
+  assert_eq(store2.list_response().stored, 0)
+  let left = @fs.readdir(dir) catch { _ => [] }
+  assert_eq(left.length(), 0)
+  @fs.rmdir(dir, recursive=true, allow_missing=true)
 }
