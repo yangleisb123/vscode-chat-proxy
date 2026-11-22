@@ -190,23 +190,30 @@ SSE 流式透传、chunked 请求体、GET/其他路径透传、`Authorization` 
 
 ## 项目结构
 
+按 MoonBit 包组织惯例分层（facade + 公共包 + internal 实现包，
+参考 `moonbitlang/async`、rabbita 与全栈教程的结构）：
+
 ```
-prefix.mbt        # 核心逻辑：system message 检查与注入（纯函数，可单测）
-http.mbt          # HTTP 请求行/状态行/头部解析、目标路径匹配、上游请求头重建
-proxy.mbt         # 异步连接处理：读请求 → 改写 → 转发 → 流式回传 + 流量捕获
-flow.mbt          # 监控数据：Flow / FlowStore 环形缓存、chunked 解码、契约类型转换
-web.mbt           # 监控 Web 服务器与 JSON API 路由
-web_assets.mbt    # 内嵌的 HTML 外壳 + 前端 JS bundle（tools/build_web.mbtx 生成）
-config.mbt        # 命令行/地址解析、环境变量配置（config_from_env）
-dotenv.mbt        # .env 文件加载（不覆盖已有环境变量）
-shared/           # 前后端共享 API 契约类型（#derive(ToJson, FromJson)）
-frontend/         # 监控前端：rabbita Elm 架构（js 目标），model/update/view + 单测
-web/index.html    # 监控页面 HTML 外壳（CSS + 挂载点）
-tools/            # build_web.mbtx：构建前端并生成内嵌资源（.mbtx 自动化脚本）
-cmd/main/         # 入口：load_env → 配置 → 任务组并发跑代理与监控两个服务器
-.env.example      # 用户配置模板（复制为 .env 使用）
-test/             # mock 上游（Node.js，端到端测试用）+ 监控页面截图
+moon.pkg / facade.mbt   # 根 facade：pub using 再导出各层公共 API（旧导入路径兼容）
+shared/                 # 前后端共享 API 契约类型（#derive(ToJson, FromJson)）
+proxy/                  # 代理核心：system 前缀注入 + 连接处理/转发/捕获
+monitor/                # 监控层：Flow/FlowStore 环形缓存、chunked 解码、
+                        #   Web 服务器与 JSON API、内嵌资源 web_assets.mbt
+config/                 # 配置层：Config、命令行/环境变量解析
+internal/httpparse/     # 实现支持：HTTP 请求行/状态行/头部解析、请求头重建
+internal/dotenv/        # 实现支持：.env 文件加载
+frontend/               # 监控前端：rabbita Elm 架构（js 目标）+ update 单测
+web/index.html          # 监控页面 HTML 外壳（CSS + 挂载点）
+tools/build_web.mbtx    # 构建前端并生成 monitor/web_assets.mbt（.mbtx 自动化）
+cmd/main/               # 入口：load_env → 配置 → 任务组并发跑代理与监控
+.env.example            # 用户配置模板（复制为 .env 使用）
+test/                   # mock 上游（Node.js）+ 监控页面截图
 ```
+
+依赖方向：`cmd/main → facade → {proxy, monitor, config} → {shared, internal/*}`；
+`frontend → shared`。internal 包只放实现支持（解析器/加载器），
+带方法的公共类型（`Config`/`Flow`/`FlowStore`）都在公共包，保证 facade
+再导出后外部仍可正常调用方法。各层测试随包放置（`*_test.mbt` / `*_wbtest.mbt`）。
 
 ## 已知限制
 

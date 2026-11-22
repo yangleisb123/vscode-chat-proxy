@@ -1,6 +1,6 @@
 ///|
 /// Max bytes stored per body (request or response) in the monitor.
-let body_capture_limit : Int32 = 256 * 1024
+pub let body_capture_limit : Int32 = 256 * 1024
 
 ///|
 /// Default number of flows kept in the ring buffer.
@@ -8,7 +8,7 @@ let default_flow_capacity : Int32 = 200
 
 ///|
 /// One proxied request/response pair, as shown in the monitor UI.
-pub struct Flow {
+pub(all) struct Flow {
   id : Int32
   start_ms : UInt64
   client_addr : String
@@ -52,7 +52,7 @@ pub fn FlowStore::new(capacity~ : Int32 = default_flow_capacity) -> FlowStore {
 
 ///|
 /// Store at most `body_capture_limit` bytes of a body.
-fn cap_bytes(b : Bytes) -> (Bytes, Bool) {
+pub fn cap_bytes(b : Bytes) -> (Bytes, Bool) {
   if b.length() <= body_capture_limit {
     (b, false)
   } else {
@@ -248,7 +248,7 @@ pub fn FlowStore::list_response(self : FlowStore) -> @shared.FlowsResponse {
 /// Best-effort decode of a complete chunked body (for display only;
 /// the bytes forwarded to the client are never touched).
 /// Falls back to the raw bytes when the input is not valid chunked framing.
-fn decode_chunked_body(raw : Bytes) -> Bytes {
+pub fn decode_chunked_body(raw : Bytes) -> Bytes {
   let out = @buffer.Buffer()
   let v = raw.clamped_view()
   let mut pos = 0

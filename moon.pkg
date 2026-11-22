@@ -1,16 +1,19 @@
-import {
-  "1123Javayanglei/vscode-chat-proxy/shared",
-  "moonbitlang/async/socket",
-  "moonbitlang/async/fs",
-  "moonbitlang/core/buffer",
-  "moonbitlang/core/json",
-  "moonbitlang/core/string",
-  "moonbitlang/core/env",
-  "moonbitlang/core/encoding/utf8",
-}
+// Facade package: re-exports the layered public API so existing importers
+// of `1123Javayanglei/vscode-chat-proxy` keep working.
+//
+// Layers:
+//   shared/            wire contract types (frontend + backend)
+//   proxy/             interception + forwarding core
+//   monitor/           flow store + monitor web server
+//   config/            CLI / env / .env-driven configuration
+//   internal/httpparse HTTP parsing helpers (implementation support)
+//   internal/dotenv    .env loading (implementation support)
 
 import {
-  "moonbitlang/async",
-} for "wbtest"
+  "1123Javayanglei/vscode-chat-proxy/proxy" @proxy_impl,
+  "1123Javayanglei/vscode-chat-proxy/config" @config_impl,
+  "1123Javayanglei/vscode-chat-proxy/monitor" @monitor_impl,
+  "1123Javayanglei/vscode-chat-proxy/internal/dotenv" @dotenv_impl,
+}
 
 supported_targets = "+native+wasm"

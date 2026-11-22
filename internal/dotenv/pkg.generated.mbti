@@ -1,0 +1,13 @@
+// Generated using `moon info`, DON'T EDIT IT
+package "1123Javayanglei/vscode-chat-proxy/internal/dotenv"
+
+// Values
+pub async fn load_env(path? : String) -> Unit
+
+// Errors
+
+// Types and methods
+
+// Type aliases
+
+// Traits

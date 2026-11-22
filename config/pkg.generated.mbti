@@ -1,0 +1,33 @@
+// Generated using `moon info`, DON'T EDIT IT
+package "1123Javayanglei/vscode-chat-proxy/config"
+
+// Values
+pub fn config_from_env() -> Config
+
+pub fn default_config() -> Config
+
+pub fn parse_address(String) -> Result[(String, Int32), String]
+
+pub fn parse_config(Array[String], Config) -> Result[Config, String]
+
+pub fn wants_help(Array[String]) -> Bool
+
+// Errors
+pub(all) suberror ConfigError {
+  ConfigError(String)
+}
+
+// Types and methods
+pub(all) struct Config {
+  listen_host : String
+  listen_port : Int32
+  upstream_host : String
+  upstream_port : Int32
+  web_enabled : Bool
+  web_host : String
+  web_port : Int32
+}
+
+// Type aliases
+
+// Traits

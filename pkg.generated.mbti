@@ -2,94 +2,47 @@
 package "1123Javayanglei/vscode-chat-proxy"
 
 import {
-  "1123Javayanglei/vscode-chat-proxy/shared",
+  "1123Javayanglei/vscode-chat-proxy/config",
+  "1123Javayanglei/vscode-chat-proxy/monitor",
+  "1123Javayanglei/vscode-chat-proxy/proxy",
   "moonbitlang/async/socket",
   "moonbitlang/core/json",
 }
 
 // Values
-pub fn config_from_env() -> Config
+pub fn config_from_env() -> @config.Config
 
-pub fn default_config() -> Config
+pub fn default_config() -> @config.Config
 
 pub fn ensure_system_prefix(@json.Json) -> Bool
 
-pub async fn handle_connection(@socket.Tcp, Config, FlowStore, String) -> Unit
+pub async fn handle_connection(@socket.Tcp, @config.Config, @monitor.FlowStore, String) -> Unit
 
 pub async fn load_env(path? : String) -> Unit
 
 pub fn parse_address(String) -> Result[(String, Int32), String]
 
-pub fn parse_config(Array[String], Config) -> Result[Config, String]
+pub fn parse_config(Array[String], @config.Config) -> Result[@config.Config, String]
 
 pub let required_prefix : String
 
-pub async fn run_web_server(@socket.Addr, FlowStore) -> Unit
+pub async fn run_web_server(@socket.Addr, @monitor.FlowStore) -> Unit
 
 pub fn wants_help(Array[String]) -> Bool
 
 // Errors
-pub(all) suberror ConfigError {
-  ConfigError(String)
-}
-
-pub(all) suberror ProxyError {
-  ProxyError(String)
-}
 
 // Types and methods
-pub(all) struct Config {
-  listen_host : String
-  listen_port : Int32
-  upstream_host : String
-  upstream_port : Int32
-  web_enabled : Bool
-  web_host : String
-  web_port : Int32
-}
-
-pub struct Flow {
-  id : Int32
-  start_ms : UInt64
-  client_addr : String
-  http_method : String
-  target : String
-  request_headers : Array[(String, String)]
-  request_size : Int32
-  intercepted : Bool
-  upstream : String
-  request_body : Bytes
-  request_truncated : Bool
-  mut injected : Bool
-  mut upstream_body : Bytes?
-  mut upstream_truncated : Bool
-  mut status : Int32
-  mut reason : String
-  mut response_headers : Array[(String, String)]
-  mut response_body : Bytes
-  mut response_size : Int32
-  mut response_truncated : Bool
-  mut end_ms : UInt64
-  mut error : String?
-  mut finished : Bool
-}
-pub fn Flow::detail(Self) -> @shared.FlowDetail
-pub fn Flow::summary(Self) -> @shared.FlowSummary
-
-pub struct FlowStore {
-  capacity : Int32
-  mut flows : Array[Flow]
-  mut next_id : Int32
-  mut total : Int32
-  mut injected_total : Int32
-}
-pub fn FlowStore::begin(Self, client_addr~ : String, http_method~ : String, target~ : String, request_headers~ : Array[(String, String)], request_body~ : Bytes, intercepted~ : Bool, upstream~ : String) -> Flow
-pub fn FlowStore::clear(Self) -> Unit
-pub fn FlowStore::find(Self, Int32) -> Flow?
-pub fn FlowStore::finish(Self, Flow) -> Unit
-pub fn FlowStore::list_response(Self) -> @shared.FlowsResponse
-pub fn FlowStore::new(capacity? : Int32) -> Self
 
 // Type aliases
+pub using @config {type Config}
+
+pub using @config {type ConfigError}
+
+pub using @monitor {type Flow}
+
+pub using @monitor {type FlowStore}
+
+pub using @proxy {type ProxyError}
 
 // Traits

@@ -1,0 +1,30 @@
+// Generated using `moon info`, DON'T EDIT IT
+package "1123Javayanglei/vscode-chat-proxy/internal/httpparse"
+
+// Values
+pub fn build_upstream_head(RequestHead, String, Int32, Int32, Bool) -> String
+
+pub fn header_value(RequestHead, String) -> String?
+
+pub fn is_chat_completions(String, String) -> Bool
+
+pub fn parse_header_line(String) -> (String, String)?
+
+pub fn parse_request_line(String) -> (String, String, String)?
+
+pub fn parse_status_line(String) -> (Int32, String)?
+
+pub fn target_path(String) -> String
+
+// Errors
+
+// Types and methods
+pub(all) struct RequestHead {
+  http_method : String
+  target : String
+  headers : Array[(String, String)]
+}
+
+// Type aliases
+
+// Traits

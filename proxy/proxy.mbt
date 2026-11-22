@@ -15,8 +15,8 @@ pub(all) suberror ProxyError {
 /// in the flow store for the monitor UI.
 pub async fn handle_connection(
   client : @socket.Tcp,
-  cfg : Config,
-  store : FlowStore,
+  cfg : @config.Config,
+  store : @monitor.FlowStore,
   client_addr : String,
 ) -> Unit {
   handle_connection_inner(client, cfg, store, client_addr) catch {
@@ -27,15 +27,16 @@ pub async fn handle_connection(
 ///|
 async fn handle_connection_inner(
   client : @socket.Tcp,
-  cfg : Config,
-  store : FlowStore,
+  cfg : @config.Config,
+  store : @monitor.FlowStore,
   client_addr : String,
 ) -> Unit {
   let line = match client.read_until("\r\n") {
     Some(l) if !l.is_empty() => l
     _ => return // client closed without sending anything
   }
-  let (http_method, target, _version) = match parse_request_line(line) {
+  let (http_method, target, _version) = match
+    @httpparse.parse_request_line(line) {
     Some(parts) => parts
     None => {
       send_simple(client, 400, "Bad Request")
@@ -51,24 +52,24 @@ async fn handle_connection_inner(
     match client.read_until("\r\n") {
       Some("") => break
       Some(l) =>
-        match parse_header_line(l) {
+        match @httpparse.parse_header_line(l) {
           Some(h) => headers.push(h)
           None => ()
         }
       None => return // EOF in the middle of headers
     }
   }
-  let head : RequestHead = { http_method, target, headers, }
-  if header_value(head, "upgrade") is Some(_) {
+  let head : @httpparse.RequestHead = { http_method, target, headers, }
+  if @httpparse.header_value(head, "upgrade") is Some(_) {
     send_simple(client, 501, "Not Implemented")
     return
   }
-  if header_value(head, "expect") is Some(v) &&
+  if @httpparse.header_value(head, "expect") is Some(v) &&
     v.clamped_view().to_lower().contains("100-continue") {
     client.write("HTTP/1.1 100 Continue\r\n\r\n")
   }
   let body = read_request_body(client, head)
-  let intercepted = is_chat_completions(http_method, target)
+  let intercepted = @httpparse.is_chat_completions(http_method, target)
   let upstream_addr = cfg.upstream_host + ":" + cfg.upstream_port.to_string()
   let flow = store.begin(
     client_addr~,
@@ -94,7 +95,7 @@ async fn handle_connection_inner(
         if ensure_system_prefix(json) {
           out_body = @utf8.encode(json.stringify())
           flow.injected = true
-          let (capped, truncated) = cap_bytes(out_body)
+          let (capped, truncated) = @monitor.cap_bytes(out_body)
           flow.upstream_body = Some(capped)
           flow.upstream_truncated = truncated
           println(
@@ -148,7 +149,7 @@ async fn handle_connection_inner(
     http_method == "POST" ||
     http_method == "PUT" ||
     http_method == "PATCH"
-  let out_head = build_upstream_head(
+  let out_head = @httpparse.build_upstream_head(
     head,
     cfg.upstream_host,
     cfg.upstream_port,
@@ -170,7 +171,7 @@ async fn handle_connection_inner(
       return
     }
   }
-  match parse_status_line(status_line) {
+  match @httpparse.parse_status_line(status_line) {
     Some((code, reason)) => {
       flow.status = code
       flow.reason = reason
@@ -187,7 +188,7 @@ async fn handle_connection_inner(
       }
       Some(l) => {
         head_raw = head_raw + l + "\r\n"
-        match parse_header_line(l) {
+        match @httpparse.parse_header_line(l) {
           Some(h) => resp_headers.push(h)
           None => ()
         }
@@ -208,8 +209,8 @@ async fn handle_connection_inner(
       Some(chunk) => {
         client.write(chunk)
         resp_size += chunk.length()
-        if buf.length() < body_capture_limit {
-          let room = body_capture_limit - buf.length()
+        if buf.length() < @monitor.body_capture_limit {
+          let room = @monitor.body_capture_limit - buf.length()
           let take = if chunk.length() < room { chunk.length() } else { room }
           buf.write_bytes(chunk.clamped_view(end=take))
         }
@@ -218,9 +219,13 @@ async fn handle_connection_inner(
     }
   }
   let raw = buf.to_bytes()
-  flow.response_body = if resp_chunked { decode_chunked_body(raw) } else { raw }
+  flow.response_body = if resp_chunked {
+    @monitor.decode_chunked_body(raw)
+  } else {
+    raw
+  }
   flow.response_size = resp_size
-  flow.response_truncated = resp_size > body_capture_limit
+  flow.response_truncated = resp_size > @monitor.body_capture_limit
   store.finish(flow)
 }
 
@@ -237,8 +242,11 @@ fn find_header(headers : Array[(String, String)], name : String) -> String? {
 ///|
 /// Read the request body, supporting both `Content-Length` and
 /// `Transfer-Encoding: chunked`.
-async fn read_request_body(client : @socket.Tcp, head : RequestHead) -> Bytes {
-  let chunked = match header_value(head, "transfer-encoding") {
+async fn read_request_body(
+  client : @socket.Tcp,
+  head : @httpparse.RequestHead,
+) -> Bytes {
+  let chunked = match @httpparse.header_value(head, "transfer-encoding") {
     Some(v) => v.clamped_view().to_lower().contains("chunked")
     None => false
   }
@@ -274,7 +282,7 @@ async fn read_request_body(client : @socket.Tcp, head : RequestHead) -> Bytes {
     }
     return buf.to_bytes()
   }
-  match header_value(head, "content-length") {
+  match @httpparse.header_value(head, "content-length") {
     Some(v) => {
       let n = @string.parse_int(v.clamped_view().trim()) catch {
         _ => raise ProxyError("bad Content-Length: " + v)

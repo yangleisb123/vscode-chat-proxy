@@ -18,7 +18,8 @@ async fn handle_web_inner(conn : @socket.Tcp, store : FlowStore) -> Unit {
     Some(l) if !l.is_empty() => l
     _ => return
   }
-  let (http_method, target, _version) = match parse_request_line(line) {
+  let (http_method, target, _version) = match
+    @httpparse.parse_request_line(line) {
     Some(parts) => parts
     None => {
       send_text(conn, 400, "Bad Request", "text/plain", "bad request")
@@ -33,7 +34,7 @@ async fn handle_web_inner(conn : @socket.Tcp, store : FlowStore) -> Unit {
       None => return
     }
   }
-  let path = target_path(target)
+  let path = @httpparse.target_path(target)
   if http_method == "GET" && path == "/" {
     send_text(conn, 200, "OK", "text/html; charset=utf-8", index_html)
   } else if http_method == "GET" && path == "/frontend.js" {

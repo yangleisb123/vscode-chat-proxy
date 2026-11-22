@@ -1,5 +1,5 @@
 ///|
-priv struct RequestHead {
+pub(all) struct RequestHead {
   http_method : String
   target : String
   headers : Array[(String, String)]
@@ -7,7 +7,7 @@ priv struct RequestHead {
 
 ///|
 /// Parse a request line like `POST /v1/chat/completions HTTP/1.1`.
-fn parse_request_line(line : String) -> (String, String, String)? {
+pub fn parse_request_line(line : String) -> (String, String, String)? {
   match line.clamped_view().split_once(" ") {
     Some((http_method, rest)) =>
       match rest.split_once(" ") {
@@ -27,7 +27,7 @@ fn parse_request_line(line : String) -> (String, String, String)? {
 
 ///|
 /// Parse a response status line like `HTTP/1.1 200 OK`.
-fn parse_status_line(line : String) -> (Int32, String)? {
+pub fn parse_status_line(line : String) -> (Int32, String)? {
   match line.clamped_view().split_once(" ") {
     Some((version, rest)) if version.has_prefix("HTTP/") => {
       let (code_str, reason) = match rest.split_once(" ") {
@@ -43,7 +43,7 @@ fn parse_status_line(line : String) -> (Int32, String)? {
 
 ///|
 /// Parse a header line like `Content-Type: application/json`.
-fn parse_header_line(line : String) -> (String, String)? {
+pub fn parse_header_line(line : String) -> (String, String)? {
   match line.clamped_view().split_once(":") {
     Some((name, value)) if !name.is_empty() =>
       Some((name.to_owned(), value.trim().to_owned()))
@@ -53,7 +53,7 @@ fn parse_header_line(line : String) -> (String, String)? {
 
 ///|
 /// Case-insensitive header lookup.
-fn header_value(head : RequestHead, name : String) -> String? {
+pub fn header_value(head : RequestHead, name : String) -> String? {
   for pair in head.headers {
     if pair.0.clamped_view().equal_ignore_ascii_case(name) {
       return Some(pair.1)
@@ -65,7 +65,7 @@ fn header_value(head : RequestHead, name : String) -> String? {
 ///|
 /// Path part of a request target, without the query string.
 /// Handles origin-form (`/v1/...`) and absolute-form (`http://host/v1/...`).
-fn target_path(target : String) -> String {
+pub fn target_path(target : String) -> String {
   let mut v = target.clamped_view()
   if v.has_prefix("http://") || v.has_prefix("https://") {
     let rest = v.clamped_view(start=8)
@@ -88,7 +88,7 @@ fn target_path(target : String) -> String {
 ///|
 /// Whether this request targets the Chat Completions API:
 /// `POST` to a path ending with `/v1/chat/completions`.
-fn is_chat_completions(http_method : String, target : String) -> Bool {
+pub fn is_chat_completions(http_method : String, target : String) -> Bool {
   http_method == "POST" &&
   target_path(target).has_suffix("/v1/chat/completions")
 }
@@ -97,7 +97,7 @@ fn is_chat_completions(http_method : String, target : String) -> Bool {
 /// Rebuild the request head for the upstream connection:
 /// rewrite `Host`, force `Connection: close`, drop hop-by-hop headers
 /// and set `Content-Length` to the (possibly rewritten) body size.
-fn build_upstream_head(
+pub fn build_upstream_head(
   head : RequestHead,
   upstream_host : String,
   upstream_port : Int32,
