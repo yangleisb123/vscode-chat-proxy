@@ -1,0 +1,43 @@
+// Generated using `moon info`, DON'T EDIT IT
+package "username/vscode-chat-proxy"
+
+import {
+  "moonbitlang/async/socket",
+  "moonbitlang/core/json",
+}
+
+// Values
+pub fn default_config() -> Config
+
+pub fn ensure_system_prefix(@json.Json) -> Bool
+
+pub async fn handle_connection(@socket.Tcp, Config) -> Unit
+
+pub fn parse_address(String) -> Result[(String, Int32), String]
+
+pub fn parse_config(Array[String], Config) -> Result[Config, String]
+
+pub let required_prefix : String
+
+pub fn wants_help(Array[String]) -> Bool
+
+// Errors
+pub(all) suberror ConfigError {
+  ConfigError(String)
+}
+
+pub(all) suberror ProxyError {
+  ProxyError(String)
+}
+
+// Types and methods
+pub(all) struct Config {
+  listen_host : String
+  listen_port : Int32
+  upstream_host : String
+  upstream_port : Int32
+}
+
+// Type aliases
+
+// Traits
