@@ -269,6 +269,44 @@ SSE 流式透传、chunked 请求体、GET/其他路径透传、`Authorization` 
 `.env` 加载与「命令行 > 环境变量 > .env」优先级、
 监控页面列表/详情/注入对比/SSE 出参捕获（浏览器实测）。
 
+## 性能（vs mitmproxy）
+
+基准脚本见 [test/bench/](test/bench/)（`upstream-fast.mjs` 极简 keep-alive 上游 +
+`loadgen.mjs` 固定并发压测器）。在 **2 核 Linux、loopback、小 JSON POST、客户端 keep-alive**
+下实测（mitmproxy 11.0.2，同机同上游，明文 HTTP 转发路径）：
+
+| 路径 | 并发 | RPS | p50 | p99 |
+|---|---|---|---|---|
+| 直连（无代理） | 32 | ~8850 | 3.2ms | 11.4ms |
+| **本代理**（监控落盘开） | 32 | ~1180 | 25.2ms | 55.2ms |
+| **本代理**（`--no-web` 内存库） | 32 | ~1500 | 19.0ms | 40.3ms |
+| **本代理**（拦截关） | 32 | ~1300 | 22.2ms | 41.9ms |
+| mitmproxy 11.0.2 | 32 | ~550 | 56.2ms | 95.0ms |
+| **本代理**（落盘开） | 64 | ~1170 | 52.9ms | 80.1ms |
+| **本代理**（`--no-web`） | 64 | ~1570 | 37.5ms | 73.9ms |
+| mitmproxy 11.0.2 | 64 | ~550 | 113.3ms | 178.3ms |
+
+**结论：明文 HTTP 转发路径上，吞吐约为 mitmproxy 的 2.1–2.7×，p50 延迟约低 2–3×。**
+两者都在单进程内饱和（并发 32→64 RPS 不涨），本代理饱和点更高。
+
+口径与限制（务必注意）：
+- **只比明文 HTTP 转发**。mitmproxy 默认对 HTTPS 做 MITM（TLS 终止+重签），本代理 HTTPS 走盲隧道
+  不做 MITM——那部分工作量不同，不能直接比。
+- mitmproxy 每请求做完整 HTTP 解析/flow 对象/addons 钩子且上游 keep-alive 复用；本代理解析极简但
+  **单线程事件循环** + 每请求新建上游连接 + 每请求监控 SQLite 落盘。
+- 监控落盘（默认开）约占 20–25% 吞吐；`--no-web` 或未来的批量/异步落盘可进一步拉大差距。
+- 直连 ~9k 是 node 上游在 2 核上的上限，不代表代理开销；代理额外成本主要是注入解析+存储+转发连接。
+
+复现：
+```bash
+node test/bench/upstream-fast.mjs 18080 &
+main.exe --forward --listen 127.0.0.1:18787 --web 127.0.0.1:18788 &
+mitmdump --mode regular --listen-port 18789 -q &
+node test/bench/loadgen.mjs proxy 18787 18080 32 5   # 本代理
+node test/bench/loadgen.mjs proxy 18789 18080 32 5   # mitmproxy
+node test/bench/loadgen.mjs direct 0 18080 32 5      # 直连基线
+```
+
 ## 项目结构
 
 按 MoonBit 包组织惯例分层（facade + 公共包 + internal 实现包，
