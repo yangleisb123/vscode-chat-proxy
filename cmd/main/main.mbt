@@ -37,6 +37,8 @@ async fn main {
   store.set_intercept_enabled(cfg.intercept)
   try
     @async.with_task_group() <| group => {
+      // Batched monitor persistence off the proxy hot path.
+      group.spawn_bg(allow_failure=true) <| () => { store.run_flusher() }
       // Monitor web UI (mitmweb style). Its failure must not kill the proxy.
       if cfg.web_enabled {
         group.spawn_bg(allow_failure=true) <| () => {

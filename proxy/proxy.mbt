@@ -3,16 +3,40 @@
 let max_body_size : Int32 = 64 * 1024 * 1024
 
 ///|
+/// Max idle upstream connections kept per (host,port) for reuse.
+let pool_max_idle : Int32 = 32
+
+///|
+/// Idle upstream connection pool (single-threaded event loop, no lock needed).
+let upstream_pool : Map[String, Array[@socket.Tcp]] = Map([])
+
+///|
+/// Capped copy of a response body for the monitor, plus total byte count.
+priv struct BodyCapture {
+  buf : @buffer.Buffer
+  mut size : Int32
+}
+
+///|
+fn BodyCapture::add(self : BodyCapture, chunk : Bytes) -> Unit {
+  self.size += chunk.length()
+  if self.buf.length() < @monitor.body_capture_limit {
+    let room = @monitor.body_capture_limit - self.buf.length()
+    let take = if chunk.length() < room { chunk.length() } else { room }
+    self.buf.write_bytes(chunk.clamped_view(end=take))
+  }
+}
+
+///|
 pub(all) suberror ProxyError {
   ProxyError(String)
 }
 
 ///|
-/// Handle one client connection: read one HTTP request, optionally rewrite
-/// the Chat Completions system message, forward it to the upstream and
-/// stream the response back (SSE works). The connection is closed
-/// afterwards (`Connection: close`). Every proxied request is recorded
-/// in the flow store for the monitor UI.
+/// Handle one client connection: serve requests in a keep-alive loop, rewriting
+/// the Chat Completions system message on the way and reusing pooled upstream
+/// connections. SSE / chunked responses are streamed chunk-by-chunk. Every
+/// request is recorded in the flow store for the monitor UI.
 pub async fn handle_connection(
   client : @socket.Tcp,
   cfg : @config.Config,
@@ -25,110 +49,148 @@ pub async fn handle_connection(
 }
 
 ///|
+fn pool_key(host : String, port : Int32) -> String {
+  host + ":" + port.to_string()
+}
+
+///|
+/// Take an upstream connection: reuse an idle pooled one when available,
+/// otherwise dial. Returns (conn, from_pool) so callers can retry once on a
+/// stale pooled socket.
+async fn take_upstream(host : String, port : Int32) -> (@socket.Tcp, Bool) {
+  let key = pool_key(host, port)
+  match upstream_pool.get(key) {
+    Some(arr) =>
+      match arr.pop() {
+        Some(conn) => (conn, true)
+        None => (@socket.Tcp::connect_to_host(host, port~), false)
+      }
+    None => (@socket.Tcp::connect_to_host(host, port~), false)
+  }
+}
+
+///|
+fn return_upstream(host : String, port : Int32, conn : @socket.Tcp) -> Unit {
+  let key = pool_key(host, port)
+  let arr = upstream_pool.get_or_init(key, () => [])
+  if arr.length() < pool_max_idle {
+    arr.push(conn)
+  } else {
+    conn.close()
+  }
+}
+
+///|
 async fn handle_connection_inner(
   client : @socket.Tcp,
   cfg : @config.Config,
   store : @monitor.FlowStore,
   client_addr : String,
 ) -> Unit {
-  let line = match client.read_until("\r\n") {
-    Some(l) if !l.is_empty() => l
-    _ => return // client closed without sending anything
-  }
-  let (http_method, target, _version) = match
-    @httpparse.parse_request_line(line) {
-    Some(parts) => parts
-    None => {
-      send_simple(client, 400, "Bad Request")
-      return
-    }
-  }
-  if http_method == "CONNECT" {
-    handle_connect(client, target, store, client_addr)
-    return
-  }
-  let headers : Array[(String, String)] = []
+  // Keep-alive loop: serve multiple requests per client connection.
   for ;; {
-    match client.read_until("\r\n") {
-      Some("") => break
-      Some(l) =>
-        match @httpparse.parse_header_line(l) {
-          Some(h) => headers.push(h)
-          None => ()
-        }
-      None => return // EOF in the middle of headers
+    let line = match client.read_until("\r\n") {
+      Some(l) => l
+      None => return // client closed
     }
-  }
-  // Destination: in forward-proxy mode it is derived from the request itself
-  // (absolute-form URL, or the Host header for origin-form targets), exactly
-  // like mitmproxy; reverse mode keeps the pinned upstream.
-  let (up_host, up_port, out_target) = if cfg.forward {
-    if target.clamped_view().has_prefix("http://") {
-      match @httpparse.absolute_http_target(target) {
-        Some((h, p, path)) => (h, p, path)
-        None => {
-          send_simple(client, 400, "Bad Request")
-          return
-        }
+    if line.is_empty() {
+      continue
+    }
+    let (http_method, target, version) = match
+      @httpparse.parse_request_line(line) {
+      Some(parts) => parts
+      None => {
+        send_simple(client, 400, "Bad Request")
+        return
       }
-    } else if target.clamped_view().has_prefix("https://") {
-      send_simple(client, 501, "HTTPS MITM Not Supported")
+    }
+    if http_method == "CONNECT" {
+      handle_connect(client, target, store, client_addr)
       return
-    } else {
-      match @httpparse.header_value({ http_method, target, headers, }, "host") {
-        Some(hv) =>
-          match @httpparse.parse_authority(hv, 80) {
-            Some((h, p)) => (h, p, target)
-            None => {
-              send_simple(client, 400, "Bad Host Header")
-              return
-            }
+    }
+    let headers : Array[(String, String)] = []
+    for ;; {
+      match client.read_until("\r\n") {
+        Some("") => break
+        Some(l) =>
+          match @httpparse.parse_header_line(l) {
+            Some(h) => headers.push(h)
+            None => ()
           }
-        None => {
-          send_simple(client, 400, "Missing Host Header")
-          return
-        }
+        None => return
       }
     }
-  } else {
-    (cfg.upstream_host, cfg.upstream_port, target)
-  }
-  let head : @httpparse.RequestHead = {
-    http_method,
-    target: out_target,
-    headers,
-  }
-  if @httpparse.header_value(head, "upgrade") is Some(_) {
-    send_simple(client, 501, "Not Implemented")
-    return
-  }
-  if @httpparse.header_value(head, "expect") is Some(v) &&
-    v.clamped_view().to_lower().contains("100-continue") {
-    client.write("HTTP/1.1 100 Continue\r\n\r\n")
-  }
-  let body = read_request_body(client, head)
-  let intercepted = store.intercept_enabled() &&
-    @httpparse.is_chat_completions(http_method, out_target)
-  let upstream_addr = up_host + ":" + up_port.to_string()
-  let flow = store.begin(
-    client_addr~,
-    http_method~,
-    target~,
-    request_headers=headers,
-    request_body=body,
-    intercepted~,
-    upstream=upstream_addr,
-  )
-  // Finalize the flow even if the connection aborts mid-way.
-  errdefer (if !flow.finished {
-    if flow.error is None {
-      flow.error = Some("connection aborted")
+    let conn_hdr = match
+      @httpparse.header_value({ http_method, target, headers, }, "connection") {
+      Some(v) => v.clamped_view().to_lower()
+      None => ""
     }
-    store.finish(flow)
-  })
-  let mut out_body = body
-  if intercepted {
-    if body.length() > 0 {
+    let client_keep = if version == "HTTP/1.0" {
+      conn_hdr.contains("keep-alive")
+    } else {
+      !conn_hdr.contains("close")
+    }
+    // Destination: forward mode derives it from the request itself; reverse
+    // mode keeps the pinned upstream.
+    let (up_host, up_port, out_target) = if cfg.forward {
+      if target.clamped_view().has_prefix("http://") {
+        match @httpparse.absolute_http_target(target) {
+          Some((h, p, path)) => (h, p, path)
+          None => {
+            send_simple(client, 400, "Bad Request")
+            return
+          }
+        }
+      } else if target.clamped_view().has_prefix("https://") {
+        send_simple(client, 501, "HTTPS MITM Not Supported")
+        return
+      } else {
+        match
+          @httpparse.header_value({ http_method, target, headers, }, "host") {
+          Some(hv) =>
+            match @httpparse.parse_authority(hv, 80) {
+              Some((h, p)) => (h, p, target)
+              None => {
+                send_simple(client, 400, "Bad Host Header")
+                return
+              }
+            }
+          None => {
+            send_simple(client, 400, "Missing Host Header")
+            return
+          }
+        }
+      }
+    } else {
+      (cfg.upstream_host, cfg.upstream_port, target)
+    }
+    let head : @httpparse.RequestHead = {
+      http_method,
+      target: out_target,
+      headers,
+    }
+    if @httpparse.header_value(head, "upgrade") is Some(_) {
+      send_simple(client, 501, "Not Implemented")
+      return
+    }
+    if @httpparse.header_value(head, "expect") is Some(v) &&
+      v.clamped_view().to_lower().contains("100-continue") {
+      client.write("HTTP/1.1 100 Continue\r\n\r\n")
+    }
+    let body = read_request_body(client, head)
+    let intercepted = store.intercept_enabled() &&
+      @httpparse.is_chat_completions(http_method, out_target)
+    let flow = store.begin(
+      client_addr~,
+      http_method~,
+      target~,
+      request_headers=headers,
+      request_body=body,
+      intercepted~,
+      upstream=pool_key(up_host, up_port),
+    )
+    let mut out_body = body
+    if intercepted && body.length() > 0 {
       try {
         let json = @json.parse(@utf8.decode(body))
         if ensure_system_prefix_with(json, cfg.system_prompt) {
@@ -137,21 +199,6 @@ async fn handle_connection_inner(
           let (capped, truncated) = @monitor.cap_bytes(out_body)
           flow.upstream_body = Some(capped)
           flow.upstream_truncated = truncated
-          println(
-            "[proxy] " +
-            http_method +
-            " " +
-            target +
-            " -> injected system prefix",
-          )
-        } else {
-          println(
-            "[proxy] " +
-            http_method +
-            " " +
-            target +
-            " -> system prefix ok, pass through",
-          )
         }
       } catch {
         e =>
@@ -161,52 +208,113 @@ async fn handle_connection_inner(
             ")",
           )
       }
+    }
+    let send_cl = out_body.length() > 0 ||
+      http_method == "POST" ||
+      http_method == "PUT" ||
+      http_method == "PATCH"
+    let out_head = @httpparse.build_upstream_head_keepalive(
+      head,
+      up_host,
+      up_port,
+      out_body.length(),
+      send_cl,
+    )
+    // Send request and read the response status line, retrying once on a stale
+    // pooled connection.
+    let (conn, status_line) = match
+      send_and_read_head(up_host, up_port, out_head, out_body) {
+      Ok(pair) => pair
+      Err(msg) => {
+        flow.error = Some(msg)
+        flow.status = 502
+        flow.reason = "Bad Gateway"
+        send_simple(client, 502, "Bad Gateway")
+        store.finish(flow)
+        return
+      }
+    }
+    let framed = forward_response(client, conn, flow, status_line, client_keep) catch {
+      e => {
+        conn.close()
+        flow.error = Some("response aborted: " + e.to_string())
+        store.finish(flow)
+        return
+      }
+    }
+    store.finish(flow)
+    if framed.1 {
+      return_upstream(up_host, up_port, conn)
     } else {
-      println(
-        "[proxy] " + http_method + " " + target + " -> empty body, pass through",
-      )
+      conn.close()
+    }
+    if !(client_keep && framed.0) {
+      return // close-delimited or client asked to close
     }
   }
-  let upstream = @socket.Tcp::connect_to_host(up_host, port=up_port) catch {
-    e => {
-      println("[proxy] upstream connect failed: " + e.to_string())
-      flow.error = Some("upstream connect failed: " + e.to_string())
-      flow.status = 502
-      flow.reason = "Bad Gateway"
-      flow.response_body = @utf8.encode("proxy error: Bad Gateway\n")
-      flow.response_size = flow.response_body.length()
-      send_simple(client, 502, "Bad Gateway")
-      store.finish(flow)
-      return
+}
+
+///|
+/// Send the request head+body on a (possibly pooled) upstream connection and
+/// read the response status line. A stale pooled socket is discarded and the
+/// request retried once on a fresh connection.
+async fn send_and_read_head(
+  host : String,
+  port : Int32,
+  out_head : String,
+  out_body : Bytes,
+) -> Result[(@socket.Tcp, String), String] {
+  let taken = take_upstream(host, port) catch {
+    e => return Err("upstream connect failed: " + e.to_string())
+  }
+  let mut conn = taken.0
+  let mut from_pool = taken.1
+  for attempt in [0, 1] {
+    let wrote = try {
+      conn.write(out_head)
+      if out_body.length() > 0 {
+        conn.write(out_body)
+      }
+      true
+    } catch {
+      _ => false
+    }
+    let status = if wrote {
+      conn.read_until("\r\n") catch {
+        _ => None
+      }
+    } else {
+      None
+    }
+    match status {
+      Some(l) if !l.is_empty() => return Ok((conn, l))
+      _ => {
+        conn.close()
+        if attempt == 0 && from_pool {
+          from_pool = false
+          conn = @socket.Tcp::connect_to_host(host, port~) catch {
+            e => return Err("upstream connect failed: " + e.to_string())
+          }
+          continue
+        }
+        return Err("upstream closed without response")
+      }
     }
   }
-  defer upstream.close()
-  let send_cl = out_body.length() > 0 ||
-    http_method == "POST" ||
-    http_method == "PUT" ||
-    http_method == "PATCH"
-  let out_head = @httpparse.build_upstream_head(
-    head,
-    up_host,
-    up_port,
-    out_body.length(),
-    send_cl,
-  )
-  upstream.write(out_head)
-  if out_body.length() > 0 {
-    upstream.write(out_body)
-  }
-  // Read the response head for the monitor, forward it verbatim to the
-  // client, then stream the body back as it arrives (SSE / chunked),
-  // capturing a capped copy for the monitor.
-  let status_line = match upstream.read_until("\r\n") {
-    Some(l) => l
-    None => {
-      flow.error = Some("upstream closed without response")
-      store.finish(flow)
-      return
-    }
-  }
+  Err("upstream closed without response")
+}
+
+///|
+/// Forward the response head (rewriting Connection) and stream the body with
+/// correct framing so the upstream connection can be reused. Returns
+/// (framed, upstream_reusable).
+async fn forward_response(
+  client : @socket.Tcp,
+  conn : @socket.Tcp,
+  flow : @monitor.Flow,
+  status_line : String,
+  client_keep : Bool,
+) -> (Bool, Bool) {
   match @httpparse.parse_status_line(status_line) {
     Some((code, reason)) => {
       flow.status = code
@@ -217,7 +325,7 @@ async fn handle_connection_inner(
   let resp_headers : Array[(String, String)] = []
   let mut head_raw = status_line + "\r\n"
   for ;; {
-    match upstream.read_until("\r\n") {
+    match conn.read_until("\r\n") {
       Some("") => {
         head_raw = head_raw + "\r\n"
         break
@@ -233,36 +341,105 @@ async fn handle_connection_inner(
     }
   }
   flow.response_headers = resp_headers
-  client.write(head_raw)
-  let resp_chunked = match find_header(resp_headers, "transfer-encoding") {
+  let resp_conn = match find_header(resp_headers, "connection") {
+    Some(v) => v.clamped_view().to_lower()
+    None => ""
+  }
+  let cl = match find_header(resp_headers, "content-length") {
+    Some(v) =>
+      Some(@string.parse_int(v.clamped_view().trim()) catch { _ => -1 })
+    None => None
+  }
+  let chunked = match find_header(resp_headers, "transfer-encoding") {
     Some(v) => v.clamped_view().to_lower().contains("chunked")
     None => false
   }
-  let buf = @buffer.Buffer()
-  let mut resp_size = 0
-  for ;; {
-    match upstream.read_some(max_len=65536) {
-      Some(chunk) => {
-        client.write(chunk)
-        resp_size += chunk.length()
-        if buf.length() < @monitor.body_capture_limit {
-          let room = @monitor.body_capture_limit - buf.length()
-          let take = if chunk.length() < room { chunk.length() } else { room }
-          buf.write_bytes(chunk.clamped_view(end=take))
-        }
+  let framed = chunked || (cl is Some(n) && n >= 0)
+  let upstream_keep = framed &&
+    !resp_conn.contains("close") &&
+    (
+      status_line.clamped_view().has_prefix("HTTP/1.1") ||
+      resp_conn.contains("keep-alive")
+    )
+  // Rewrite Connection to match what the client connection will do.
+  let mut out_head = status_line + "\r\n"
+  for pair in resp_headers {
+    if pair.0.clamped_view().equal_ignore_ascii_case("connection") {
+      continue
+    }
+    out_head = out_head + pair.0 + ": " + pair.1 + "\r\n"
+  }
+  out_head = out_head +
+    "Connection: " +
+    (if framed && client_keep { "keep-alive" } else { "close" }) +
+    "\r\n\r\n"
+  client.write(out_head)
+  let cap : BodyCapture = { buf: @buffer.Buffer(), size: 0, }
+  if chunked {
+    for ;; {
+      let size_line = match conn.read_until("\r\n") {
+        Some(l) => l
+        None => break
       }
-      None => break
+      client.write(size_line + "\r\n")
+      cap.add(@utf8.encode(size_line + "\r\n"))
+      let size_view = match size_line.clamped_view().split_once(";") {
+        Some((s, _)) => s
+        None => size_line.clamped_view()
+      }
+      let size = @string.parse_int(size_view.trim(), radix=16) catch { _ => 0 }
+      if size == 0 {
+        for ;; {
+          match conn.read_until("\r\n") {
+            Some("") | None => break
+            Some(t) => {
+              client.write(t + "\r\n")
+              cap.add(@utf8.encode(t + "\r\n"))
+            }
+          }
+        }
+        break
+      }
+      let data = conn.read_exactly(size)
+      client.write(data)
+      cap.add(data)
+      let crlf = conn.read_exactly(2)
+      client.write(crlf)
+      cap.add(crlf)
+    }
+  } else if cl is Some(n) && n >= 0 {
+    let mut remaining = n
+    while remaining > 0 {
+      let want = if remaining < 65536 { remaining } else { 65536 }
+      match conn.read_some(max_len=want) {
+        Some(chunk) => {
+          client.write(chunk)
+          cap.add(chunk)
+          remaining -= chunk.length()
+        }
+        None => break
+      }
+    }
+  } else {
+    for ;; {
+      match conn.read_some(max_len=65536) {
+        Some(chunk) => {
+          client.write(chunk)
+          cap.add(chunk)
+        }
+        None => break
+      }
     }
   }
-  let raw = buf.to_bytes()
-  flow.response_body = if resp_chunked {
+  let raw = cap.buf.to_bytes()
+  flow.response_body = if chunked {
     @monitor.decode_chunked_body(raw)
   } else {
     raw
   }
-  flow.response_size = resp_size
-  flow.response_truncated = resp_size > @monitor.body_capture_limit
-  store.finish(flow)
+  flow.response_size = cap.size
+  flow.response_truncated = cap.size > @monitor.body_capture_limit
+  (framed, upstream_keep)
 }
 
 ///|
@@ -298,7 +475,6 @@ async fn handle_connect(
       return
     }
   }
-  // Consume the CONNECT request headers before switching to raw pumping.
   let headers : Array[(String, String)] = []
   for ;; {
     match client.read_until("\r\n") {
@@ -340,7 +516,6 @@ async fn handle_connect(
   client.write("HTTP/1.1 200 Connection Established\r\n\r\n")
   flow.status = 200
   flow.reason = "Connection Established"
-  println("[proxy] CONNECT " + target + " -> blind tunnel (no MITM)")
   let stats : TunnelStats = { up: 0, down: 0, }
   let ctl : TunnelCtl = { up_task: None, down_task: None, }
   @async.with_task_group() <| group => {
@@ -371,8 +546,7 @@ async fn handle_connect(
 ///|
 /// Pump one direction of a tunnel. On EOF or write error just return: the
 /// wrapper cancels the sibling pump (cancellation must happen while sockets
-/// are still open, otherwise CancelIoEx cannot wake a blocked read), and the
-/// sockets are closed once the whole group finishes.
+/// are still open), and the sockets are closed once the group finishes.
 async fn pump(
   src : @socket.Tcp,
   dst : @socket.Tcp,
@@ -382,8 +556,6 @@ async fn pump(
   for ;; {
     match src.read_some(max_len=65536) {
       Some(chunk) => {
-        // Count before writing: a cancellation landing on the write's
-        // suspension point must not lose the byte count.
         if is_up {
           stats.up += chunk.length()
         } else {
@@ -437,7 +609,6 @@ async fn read_request_body(
         raise ProxyError("chunked body too large")
       }
       if size == 0 {
-        // Consume trailers until the terminating empty line.
         for ;; {
           match client.read_until("\r\n") {
             Some("") | None => break
@@ -447,7 +618,7 @@ async fn read_request_body(
         break
       }
       buf.write_bytes(client.read_exactly(size))
-      let _ = client.read_exactly(2) // CRLF after each chunk
+      let _ = client.read_exactly(2)
     }
     return buf.to_bytes()
   }

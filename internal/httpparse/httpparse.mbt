@@ -151,6 +151,46 @@ pub fn absolute_http_target(target : String) -> (String, Int32, String)? {
 }
 
 ///|
+/// Like `build_upstream_head` but asks the upstream to keep the connection
+/// alive so it can be returned to the reuse pool.
+pub fn build_upstream_head_keepalive(
+  head : RequestHead,
+  upstream_host : String,
+  upstream_port : Int32,
+  body_len : Int32,
+  send_content_length : Bool,
+) -> String {
+  let authority = if upstream_port == 80 {
+    upstream_host
+  } else {
+    upstream_host + ":" + upstream_port.to_string()
+  }
+  let mut out = head.http_method + " " + head.target + " HTTP/1.1\r\n"
+  out = out + "Host: " + authority + "\r\n"
+  for pair in head.headers {
+    let n = pair.0.clamped_view()
+    if n.equal_ignore_ascii_case("host") ||
+      n.equal_ignore_ascii_case("connection") ||
+      n.equal_ignore_ascii_case("content-length") ||
+      n.equal_ignore_ascii_case("transfer-encoding") ||
+      n.equal_ignore_ascii_case("expect") ||
+      n.equal_ignore_ascii_case("keep-alive") ||
+      n.equal_ignore_ascii_case("proxy-connection") ||
+      n.equal_ignore_ascii_case("proxy-authorization") ||
+      n.equal_ignore_ascii_case("te") ||
+      n.equal_ignore_ascii_case("trailer") ||
+      n.equal_ignore_ascii_case("upgrade") {
+      continue
+    }
+    out = out + pair.0 + ": " + pair.1 + "\r\n"
+  }
+  if send_content_length {
+    out = out + "Content-Length: " + body_len.to_string() + "\r\n"
+  }
+  out + "Connection: keep-alive\r\n\r\n"
+}
+
+///|
 /// Rebuild the request head for the upstream connection:
 /// rewrite `Host`, force `Connection: close`, drop hop-by-hop headers
 /// and set `Content-Length` to the (possibly rewritten) body size.

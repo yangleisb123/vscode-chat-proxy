@@ -26,6 +26,7 @@ test "flow: begin / finish / find / clear" {
   assert_eq(store.injected_total, 1)
   let _f2 = begin_test_flow(store, "/b")
   let _f3 = begin_test_flow(store, "/c")
+  store.flush_pending() // eviction happens at flush (batched persistence)
   assert_true(store.find(1) is None) // evicted by capacity
   assert_true(store.find(3) is Some(_))
   assert_eq(store.total, 3)
@@ -123,6 +124,7 @@ async test "flow: sqlite persists to temp dir, reloads, evicts, marks stale and 
   f1.response_body = @utf8.encode("{\"ok\":1}")
   f1.response_size = 8
   store.finish(f1)
+  store.flush_pending()
   assert_true(@fs.exists(db_path))
   // Bodies are released from memory, but the detail API reads them back.
   assert_eq(f1.response_body.length(), 0)
@@ -142,24 +144,17 @@ async test "flow: sqlite persists to temp dir, reloads, evicts, marks stale and 
   store2.finish(f2)
   let f3 = begin_test_flow(store2, "/three")
   store2.finish(f3)
+  store2.flush_pending()
   assert_eq(store2.list_response().stored, 2)
   assert_true(store2.find(f1.id) is None)
   assert_true(store2.find(f2.id) is Some(_))
 
-  // A pending row from a killed process must not stay "pending" forever.
-  let pending = begin_test_flow(store2, "/pending")
+  // In-flight (begun, unfinished) flows are memory-only under batched
+  // persistence: a crashed process leaves no row for them (best-effort monitor).
+  let inflight = begin_test_flow(store2, "/inflight")
   store2.close()
   let store3 = FlowStore::open(dir, capacity=2)
-  let list3 = store3.list_response()
-  let mut saw_pending = false
-  for row in list3.flows {
-    if row.id == pending.id {
-      saw_pending = true
-      assert_true(!row.pending)
-      assert_true(row.error is Some(_))
-    }
-  }
-  assert_true(saw_pending)
+  assert_true(store3.find(inflight.id) is None)
 
   store3.clear()
   assert_eq(store3.list_response().stored, 0)
