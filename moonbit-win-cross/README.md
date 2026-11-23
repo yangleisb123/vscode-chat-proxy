@@ -61,3 +61,36 @@ doubled = 2 4 6 8 10
 - moon 0.1.20261120 / 新原生后端（MOONBIT_NEW_NATIVE=1）
 - x86_64-w64-mingw32-gcc 9.3.0
 - wine64-stable 5.0（仅用于验证）
+
+## 附：用社区包 moonrockz/zig-cross 的对比实测（2026-11-23）
+
+命令（Zig 0.17.0 装于 `~/opt/zig-x86_64-linux-0.17.0`）：
+
+```bash
+moonx moonrockz/zig-cross@0.4.1 doctor windows-x64 linux-x64 darwin-arm64
+moonx moonrockz/zig-cross@0.4.1 build windows-x64 linux-x64 darwin-arm64 -- cmd/main
+```
+
+| 目标 | 结果 | 产物 |
+|---|---|---|
+| linux-x64（musl 静态） | ✅ 本机直接运行，输出正确 | `moonbit-demo-linux-x64-musl`（1.6 MB，statically linked） |
+| darwin-arm64 | ✅ 链接成功，Mach-O arm64，NOUNDEFS | `moonbit-demo-darwin-arm64`（54 KB，未在本机运行验证） |
+| windows-x64 | ❌ 当前工具链下失败 | 见下 |
+
+Windows 失败原因（与 zig-cross 文档一致）：
+
+1. **full 运行时**含 MSVC-only 代码：`thread_pool.c` 直接
+   `#error "Currently only MSVC is supported on Windows"`，
+   `schannel.c` 需要 MSVC SDK 的 `SubAuth.h`，`socket.c` 用了
+   `SO_REUSE_MULTICASTPORT`。mingw/zig 的 Windows 头编不过。
+2. **sync 运行时子集**（可绕过上述文件）被白名单拒绝：
+   `ZC_SYNC_UNAVAILABLE` 要求精确的 MoonBit 0.10.17+d971670cd /
+   Moon 0.1.20261023 / Zig 0.17.0 组合；本机是 0.10.23 / 0.1.20261120。
+3. 想装回评估版工具链也不行：官方 CDN 对版本化下载返回 403，
+   只保留 `latest`。
+
+**结论**：zig-cross 对 Linux/macOS 目标开箱即用（比手动方案省事得多）；
+Windows 目标在当前工具链下走不通，本目录的 `moonbit-demo.exe`（手动 mingw
+方案，wine 实测通过）仍是本机可用的 Windows 产物。上游修复跟踪：
+moonbitlang/moon#2320、moonbitlang/moonbit-native-runtime#2。
+
