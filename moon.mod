@@ -11,7 +11,7 @@
 
 name = "1123Javayanglei/vscode-chat-proxy"
 
-version = "0.9.0"
+version = "0.9.1"
 
 readme = "README.mbt.md"
 
