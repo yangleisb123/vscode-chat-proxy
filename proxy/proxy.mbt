@@ -391,7 +391,15 @@ async fn forward_response(
       if size == 0 {
         for ;; {
           match conn.read_until("\r\n") {
-            Some("") | None => break
+            Some("") => {
+              // The empty line after the last chunk (and any trailers)
+              // terminates the chunked message: relay it too, or keep-alive
+              // clients wait forever for the end of the body.
+              client.write("\r\n")
+              cap.add(@utf8.encode("\r\n"))
+              break
+            }
+            None => break
             Some(t) => {
               client.write(t + "\r\n")
               cap.add(@utf8.encode(t + "\r\n"))
