@@ -1,0 +1,95 @@
+# 在 GitHub Actions 的 Windows runner 上原生构建 Windows x64 可执行文件。
+#
+# 为什么必须在 Windows 上编：
+#   - moonbitlang/async 的 Windows 运行时（IOCP 事件循环/线程池/Schannel TLS）
+#     目前只支持 MSVC（源码里 #error 拒绝其他编译器），Linux 上无法交叉编译；
+#   - core 的 #cfg(platform) 按构建机解析（moonbitlang/moon#2320），
+#     交叉编出的 Windows 版会读错 argv/环境变量/路径。
+#
+# 产物：Actions 运行页的 Artifacts 里下载 vscode-chat-proxy-windows-x64。
+
+name: Windows Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      # windows-latest 自带 VS2022（含 MSVC v143 与 Windows SDK）。
+      # 这个 action 把 cl.exe/link.exe 及 INCLUDE/LIB/PATH 注入当前环境。
+      - name: Set up MSVC x64 environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install MoonBit toolchain
+        shell: pwsh
+        run: |
+          Invoke-RestMethod https://cli.moonbitlang.com/install/powershell.ps1 | Invoke-Expression
+          "$env:USERPROFILE\.moon\bin" >> $env:GITHUB_PATH
+
+      - name: Show toolchain & fetch dependencies
+        shell: pwsh
+        run: |
+          moon version --all
+          moon update
+
+      # cmd/main/moon.pkg 里的 cc-link-flags "-lpthread -ldl" 只服务于
+      # glibc < 2.34 的 Linux；moon 会把用户链接参数原样传给 MSVC link.exe，
+      # 而 link.exe 不认 GNU 风格 -l 参数。这里仅在 CI 内置空，不改仓库语义。
+      - name: Neutralize Linux-only link flags (CI only)
+        shell: pwsh
+        run: |
+          $pkg = 'cmd/main/moon.pkg'
+          $text = Get-Content $pkg -Raw
+          $patched = $text.Replace('"cc-link-flags": "-lpthread -ldl"', '"cc-link-flags": ""')
+          if ($patched -eq $text) {
+            Write-Host 'cc-link-flags pattern not found; assuming already neutralized.'
+          } else {
+            Set-Content -Path $pkg -Value $patched -NoNewline
+            Write-Host 'Patched cmd/main/moon.pkg: cleared Linux-only cc-link-flags.'
+          }
+
+      - name: Build native release
+        shell: pwsh
+        run: moon build --target native --release
+
+      - name: Collect executable
+        shell: pwsh
+        run: |
+          $exe = '_build/native/release/build/cmd/main/main.exe'
+          if (-not (Test-Path $exe)) {
+            Get-ChildItem -Recurse _build/native/release/build -Filter *.exe | ForEach-Object { $_.FullName }
+            throw "main.exe not found at $exe"
+          }
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item $exe 'dist/vscode-chat-proxy-windows-x64.exe'
+          Get-Item 'dist/vscode-chat-proxy-windows-x64.exe' | Select-Object Name, Length
+
+      # 冒烟测试：--help 只打印用法即退出，不启动代理、不占端口。
+      - name: Smoke test (--help)
+        shell: pwsh
+        run: |
+          $out = & 'dist/vscode-chat-proxy-windows-x64.exe' --help 2>&1
+          $code = $LASTEXITCODE
+          Write-Host $out
+          if ($code -ne 0) { throw "exe --help exited with $code" }
+          if (-not ($out -match 'listen|usage|proxy')) { throw 'unexpected --help output' }
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vscode-chat-proxy-windows-x64
+          path: dist/vscode-chat-proxy-windows-x64.exe
+          if-no-files-found: error
