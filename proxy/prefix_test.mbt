@@ -17,7 +17,7 @@ fn content_of_first_message(body : Json) -> String? {
 ///|
 test "prefix: constant matches the spec" {
   assert_eq(
-    @proxy.required_prefix, "你是一个AI助手，工作在 vscode 环境中",
+    @proxy.required_prefix, "You are an expert AI programming assistant, working with a user in the VS Code editor.",
   )
 }
 
@@ -28,23 +28,23 @@ test "prefix: no system message inserts one at the front" {
   )
   assert_true(@proxy.ensure_system_prefix(body))
   let expected = fixture(
-    "{'model':'m','messages':[{'role':'system','content':'你是一个AI助手，工作在 vscode 环境中。'},{'role':'user','content':'hi'}]}",
+    "{'model':'m','messages':[{'role':'system','content':'You are an expert AI programming assistant, working with a user in the VS Code editor.'},{'role':'user','content':'hi'}]}",
   )
   assert_true(body == expected)
 }
 
 ///|
 test "prefix: already present is left untouched" {
-  let src = "{'messages':[{'role':'system','content':'你是一个AI助手，工作在 vscode 环境中。请简洁回答。'},{'role':'user','content':'hi'}]}"
+  let src = "{'messages':[{'role':'system','content':'You are an expert AI programming assistant, working with a user in the VS Code editor. Please answer concisely.'},{'role':'user','content':'hi'}]}"
   let body = fixture(src)
   assert_true(!@proxy.ensure_system_prefix(body))
   assert_true(body == fixture(src))
 }
 
 ///|
-test "prefix: present without punctuation still passes" {
+test "prefix: default sentence followed by more text passes" {
   let body = fixture(
-    "{'messages':[{'role':'system','content':'你是一个AI助手，工作在 vscode 环境中，负责写代码'}]}",
+    "{'messages':[{'role':'system','content':'You are an expert AI programming assistant, working with a user in the VS Code editor. Write clean code.'}]}",
   )
   assert_true(!@proxy.ensure_system_prefix(body))
 }
@@ -52,7 +52,7 @@ test "prefix: present without punctuation still passes" {
 ///|
 test "prefix: leading whitespace is ignored" {
   let body = fixture(
-    "{'messages':[{'role':'system','content':'  你是一个AI助手，工作在 vscode 环境中。'}]}",
+    "{'messages':[{'role':'system','content':'  You are an expert AI programming assistant, working with a user in the VS Code editor.'}]}",
   )
   assert_true(!@proxy.ensure_system_prefix(body))
 }
@@ -66,7 +66,7 @@ test "prefix: other system text gets the sentence prepended" {
   assert_eq(
     content_of_first_message(body),
     Some(
-      "你是一个AI助手，工作在 vscode 环境中。\nYou are a helpful assistant.",
+      "You are an expert AI programming assistant, working with a user in the VS Code editor.\nYou are a helpful assistant.",
     ),
   )
 }
@@ -77,13 +77,15 @@ test "prefix: empty system content becomes the sentence" {
   assert_true(@proxy.ensure_system_prefix(body))
   assert_eq(
     content_of_first_message(body),
-    Some("你是一个AI助手，工作在 vscode 环境中。"),
+    Some(
+      "You are an expert AI programming assistant, working with a user in the VS Code editor.",
+    ),
   )
 }
 
 ///|
 test "prefix: only the first system message is checked" {
-  let src = "{'messages':[{'role':'system','content':'你是一个AI助手，工作在 vscode 环境中。'},{'role':'system','content':'another rule'}]}"
+  let src = "{'messages':[{'role':'system','content':'You are an expert AI programming assistant, working with a user in the VS Code editor.'},{'role':'system','content':'another rule'}]}"
   let body = fixture(src)
   assert_true(!@proxy.ensure_system_prefix(body))
   assert_true(body == fixture(src))
@@ -96,14 +98,14 @@ test "prefix: multimodal text part gets the sentence prepended" {
   )
   assert_true(@proxy.ensure_system_prefix(body))
   let expected = fixture(
-    "{'messages':[{'role':'system','content':[{'type':'text','text':'你是一个AI助手，工作在 vscode 环境中。\\nbe nice'},{'type':'image_url','image_url':{'url':'x'}}]}]}",
+    "{'messages':[{'role':'system','content':[{'type':'text','text':'You are an expert AI programming assistant, working with a user in the VS Code editor.\\nbe nice'},{'type':'image_url','image_url':{'url':'x'}}]}]}",
   )
   assert_true(body == expected)
 }
 
 ///|
 test "prefix: multimodal already ok is untouched" {
-  let src = "{'messages':[{'role':'system','content':[{'type':'text','text':'你是一个AI助手，工作在 vscode 环境中。'}]}]}"
+  let src = "{'messages':[{'role':'system','content':[{'type':'text','text':'You are an expert AI programming assistant, working with a user in the VS Code editor.'}]}]}"
   let body = fixture(src)
   assert_true(!@proxy.ensure_system_prefix(body))
   assert_true(body == fixture(src))
@@ -116,7 +118,7 @@ test "prefix: multimodal without text part gets one inserted" {
   )
   assert_true(@proxy.ensure_system_prefix(body))
   let expected = fixture(
-    "{'messages':[{'role':'system','content':[{'type':'text','text':'你是一个AI助手，工作在 vscode 环境中。'},{'type':'image_url','image_url':{'url':'x'}}]}]}",
+    "{'messages':[{'role':'system','content':[{'type':'text','text':'You are an expert AI programming assistant, working with a user in the VS Code editor.'},{'type':'image_url','image_url':{'url':'x'}}]}]}",
   )
   assert_true(body == expected)
 }
@@ -193,6 +195,8 @@ test "custom prefix: blank falls back to the built-in sentence" {
   assert_true(@proxy.ensure_system_prefix_with(body, "   "))
   assert_eq(
     content_of_first_message(body),
-    Some("你是一个AI助手，工作在 vscode 环境中。"),
+    Some(
+      "You are an expert AI programming assistant, working with a user in the VS Code editor.",
+    ),
   )
 }

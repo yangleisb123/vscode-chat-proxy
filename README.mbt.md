@@ -5,7 +5,7 @@
 并拦截所有 **URL 以 `/v1/chat/completions` 结尾的 POST 请求**（标准 Chat Completions API），
 确保其 System message 的第一句是**配置里指定的话术**——默认是：
 
-> 你是一个AI助手，工作在 vscode 环境中
+> You are an expert AI programming assistant, working with a user in the VS Code editor.
 
 这句话不是写死的：改 `.env` 里的 `SYSTEM_PROMPT`（或启动参数 `--system-prompt`）就能换成任意话术。
 
@@ -56,7 +56,7 @@
 无需重启）。关闭时所有请求原样转发，不做任何改写。
 
 开启时对 `POST */v1/chat/completions`（忽略 query string，支持路径带前缀如 `/openai/v1/chat/completions`）。
-下表的「配置话术」指 `.env` 里 `SYSTEM_PROMPT` 的值，默认 `你是一个AI助手，工作在 vscode 环境中`：
+下表的「配置话术」指 `.env` 里 `SYSTEM_PROMPT` 的值，默认 `You are an expert AI programming assistant, working with a user in the VS Code editor.`：
 
 | 请求体情况 | 处理 |
 |---|---|
@@ -106,7 +106,7 @@ moon run cmd/main -- --listen 127.0.0.1:8787 --upstream 127.0.0.1:8080
 - `--upstream` / `-u`：固定上游（反向代理模式）；**省略则为正向代理（默认）**
 - `--forward` / `-f`：强制正向模式（覆盖 `.env` 里固定的上游）
 - `--web` / `-w`：监控页面地址，默认 `127.0.0.1:8788`（`--web off` 或 `--no-web` 关闭）
-- `--system-prompt` / `-s`（别名 `--prompt`）：注入的 system 第一句，默认 `你是一个AI助手，工作在 vscode 环境中`
+- `--system-prompt` / `-s`（别名 `--prompt`）：注入的 system 第一句，默认 `You are an expert AI programming assistant, working with a user in the VS Code editor.`
 - `--help` 查看帮助
 
 **正向模式**下把客户端的 HTTP 代理指向代理，例如：
@@ -139,7 +139,7 @@ curl -x http://127.0.0.1:8787 http://your-api:8080/v1/chat/completions ...
 | `UPSTREAM_PORT` | 固定上游端口（明文 HTTP） | 未设置 |
 | `WEB_HOST` | 监控页面主机 | `127.0.0.1` |
 | `WEB_PORT` | 监控页面端口 | `8788` |
-| `SYSTEM_PROMPT` | 注入到 system 消息第一句的话术（`VSCODE_CHAT_PROXY_SYSTEM_PROMPT` 是等价别名；空白值回退默认） | `你是一个AI助手，工作在 vscode 环境中` |
+| `SYSTEM_PROMPT` | 注入到 system 消息第一句的话术（`VSCODE_CHAT_PROXY_SYSTEM_PROMPT` 是等价别名；空白值回退默认） | `You are an expert AI programming assistant, working with a user in the VS Code editor.` |
 | `INTERCEPT` | 拦截开关初始值（`on/off/1/0/true/false`；`VSCODE_CHAT_PROXY_INTERCEPT` 等价别名）；运行中可在监控页切换 | `on` |
 | `VSCODE_CHAT_PROXY_LISTEN` | 组合写法 `host:port`，优先于 `HOST`/`PORT` | 未设置 |
 | `VSCODE_CHAT_PROXY_UPSTREAM` | 组合写法 `host:port`（支持 `[ipv6]:port`），优先于 `UPSTREAM_HOST`/`UPSTREAM_PORT` | 未设置 |

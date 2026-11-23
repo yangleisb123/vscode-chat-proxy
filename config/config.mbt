@@ -1,7 +1,7 @@
 ///|
 /// The sentence forced to be the first sentence of the Chat Completions
 /// system message unless overridden by `SYSTEM_PROMPT` / `--system-prompt`.
-pub let default_system_prompt : String = "你是一个AI助手，工作在 vscode 环境中"
+pub let default_system_prompt : String = "You are an expert AI programming assistant, working with a user in the VS Code editor."
 
 ///|
 pub(all) struct Config {

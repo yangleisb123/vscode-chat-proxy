@@ -115,7 +115,9 @@ fn usage() -> String {
   "  -w, --web <host:port|off>   Monitor web UI address (default 127.0.0.1:8788)\n" +
   "      --no-web                Disable the monitor web UI\n" +
   "  -s, --system-prompt <text>  Sentence forced to open the system message\n" +
-  "                              (alias --prompt; default: \"你是一个AI助手，工作在 vscode 环境中\")\n" +
+  "                              (alias --prompt; default: \"You are an expert AI\n" +
+  "                              programming assistant, working with a user in the\n" +
+  "                              VS Code editor.\")\n" +
   "  -h, --help                  Show this help\n" +
   "\n" +
   "Configuration precedence: CLI flags > environment variables > .env > defaults.\n" +
