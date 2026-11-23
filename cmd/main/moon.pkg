@@ -8,3 +8,11 @@ import {
 supported_targets = "+native"
 
 pkgtype(kind: "executable")
+
+// glibc < 2.34 keeps pthread/dl outside libc; the runtime (mimalloc, thread
+// pool) and the vendored SQLite need them explicitly. On newer glibc these
+// are harmless stub libraries.
+
+options(
+  link: { "native": { "cc-link-flags": "-lpthread -ldl" } },
+)
