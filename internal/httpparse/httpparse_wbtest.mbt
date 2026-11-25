@@ -131,3 +131,32 @@ test "httpparse: absolute_http_target splits host port path" {
   assert_eq(absolute_http_target("https://host/v1"), None)
   assert_eq(absolute_http_target("/v1/chat/completions"), None)
 }
+
+///|
+test "httpparse: single-pass request head block and buffer serialization" {
+  let block = "\r\nPOST http://127.0.0.1:8080/v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1:8080\r\nAuthorization: Bearer sk-1\r\nContent-Length: 12\r\nConnection: Keep-Alive\r\nExpect: 100-Continue"
+  let parsed = parse_request_head_block(block).unwrap()
+  assert_eq(parsed.0, "POST")
+  assert_eq(parsed.1, "http://127.0.0.1:8080/v1/chat/completions")
+  assert_eq(parsed.2, "HTTP/1.1")
+  assert_eq(parsed.4.host, Some("127.0.0.1:8080"))
+  assert_eq(parsed.4.content_length, Some(12))
+  assert_true(parsed.4.expect_100)
+  assert_true(!parsed.4.upgrade)
+  assert_true(!parsed.4.chunked)
+  assert_true(contains_ignore_ascii_case("Keep-Alive", "keep-alive"))
+  assert_true(!contains_ignore_ascii_case("Keep-Alive", "close"))
+  let buf = @buffer.Buffer(capacity=128)
+  write_upstream_head_keepalive(
+    buf,
+    { http_method: "POST", target: "/v1/chat/completions", headers: parsed.3, },
+    "127.0.0.1",
+    8080,
+    42,
+    true,
+  )
+  let rendered = buf.to_bytes()
+  assert_eq(
+    rendered, b"POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1:8080\r\nAuthorization: Bearer sk-1\r\nContent-Length: 42\r\nConnection: keep-alive\r\n\r\n",
+  )
+}

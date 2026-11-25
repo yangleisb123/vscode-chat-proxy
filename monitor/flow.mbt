@@ -1,10 +1,20 @@
 ///|
+/// Shared empty byte slice to avoid allocating `@utf8.encode("")` on hot paths.
+let empty_bytes : Bytes = b""
+
+///|
 /// Max bytes stored per body (request or response) in the monitor.
 pub let body_capture_limit : Int32 = 256 * 1024
 
 ///|
 /// Default number of flows kept in the SQLite store.
 let default_flow_capacity : Int32 = 200
+
+///|
+/// Background flusher interval in milliseconds. In-memory active/pending flows
+/// are served directly by `list_response`/`detail`, so 50ms keeps UI latency
+/// invisible while amortizing WAL writes and capping burst disk churn.
+let flush_interval_ms : Int32 = 50
 
 ///|
 /// One proxied request/response pair, as shown in the monitor UI.
@@ -41,11 +51,13 @@ pub(all) struct Flow {
 ///|
 /// SQLite-backed flow store. One `monitor.sqlite` file lives in the system
 /// temp directory (see `default_store_dir`); `FlowStore::new` opens an
-/// in-memory database for tests.
+/// in-memory database for tests; `FlowStore::disabled` disables recording for
+/// `--no-web` zero-overhead proxy runs.
 ///
-/// The store is bounded: after every insert/update at most `capacity` rows are
-/// kept (`DELETE` oldest + `auto_vacuum`). Only in-flight flows keep bodies in
-/// memory; finished rows are read back from SQLite.
+/// The store is bounded: at most `capacity` rows are kept (`DELETE` oldest in
+/// the same transaction + periodic `incremental_vacuum`). Only in-flight and
+/// un-flushed flows keep bodies in memory; persisted summaries are cached in
+/// memory so `GET /api/flows` never hits SQLite.
 pub struct FlowStore {
   db : @sqlite.SqliteDriver
   dir : String
@@ -56,15 +68,32 @@ pub struct FlowStore {
   mut total : Int32
   mut injected_total : Int32
   mut intercept_enabled : Bool
+  priv recording : Bool
+  priv id_stride : Int32
+  priv mut pending_total_delta : Int32
+  priv mut pending_injected_delta : Int32
+  priv mut db_count : Int32
+  priv mut flush_ticks : Int32
+  priv mut summary_cache : Array[@shared.FlowSummary]
+  priv mut insert_stmt : &@moondb.Stmt?
+  priv mut update_stat_stmt : &@moondb.Stmt?
+  priv mut add_stat_stmt : &@moondb.Stmt?
+  priv mut evict_stmt : &@moondb.Stmt?
+  priv mut find_stmt : &@moondb.Stmt?
+  priv mut detail_stmt : &@moondb.Stmt?
 }
 
 ///|
-/// Schema + SQLite tuning. `auto_vacuum` is set before the tables so deleted
-/// rows return their pages to the filesystem; WAL keeps writes cheap while the
-/// process runs.
+/// Schema + SQLite tuning. Monitor history is best-effort temp data (losing it
+/// on power loss never affects proxy correctness), so WAL + `synchronous=OFF` +
+/// `auto_vacuum=INCREMENTAL` avoids per-flush fsync and page-relocation stalls.
+/// `id INTEGER PRIMARY KEY` is already the ordered rowid B-tree, so no extra
+/// secondary index on `id` is needed.
 let schema_sql : String = "PRAGMA journal_mode=WAL;\n" +
-  "PRAGMA synchronous=NORMAL;\n" +
-  "PRAGMA auto_vacuum=FULL;\n" +
+  "PRAGMA synchronous=OFF;\n" +
+  "PRAGMA temp_store=MEMORY;\n" +
+  "PRAGMA cache_size=-4000;\n" +
+  "PRAGMA auto_vacuum=INCREMENTAL;\n" +
   "PRAGMA busy_timeout=3000;\n" +
   "CREATE TABLE IF NOT EXISTS flows (\n" +
   "  id INTEGER PRIMARY KEY,\n" +
@@ -92,7 +121,7 @@ let schema_sql : String = "PRAGMA journal_mode=WAL;\n" +
   "  finished INTEGER NOT NULL,\n" +
   "  content_type TEXT NOT NULL\n" +
   ");\n" +
-  "CREATE INDEX IF NOT EXISTS idx_flows_id ON flows(id DESC);\n" +
+  "DROP INDEX IF EXISTS idx_flows_id;\n" +
   "CREATE TABLE IF NOT EXISTS stats (key TEXT PRIMARY KEY, value INTEGER NOT NULL);\n" +
   "INSERT OR IGNORE INTO stats (key, value) VALUES ('total', 0);\n" +
   "INSERT OR IGNORE INTO stats (key, value) VALUES ('injected_total', 0);\n"
@@ -159,16 +188,61 @@ pub fn FlowStore::set_intercept_enabled(
 }
 
 ///|
+/// Whether this store actually records flows (false for `FlowStore::disabled`,
+/// used in `--no-web` mode so the proxy pays zero monitoring overhead).
+pub fn FlowStore::is_recording(self : FlowStore) -> Bool {
+  self.recording
+}
+
+///|
+/// No-op flow store for `--no-web` mode: keeps the live `intercept_enabled`
+/// flag without touching SQLite or buffering request/response bodies.
+pub fn FlowStore::disabled() -> FlowStore {
+  let db = @sqlite.SqliteDriver::open(":memory:") catch { _ => panic() }
+  {
+    db,
+    dir: "",
+    capacity: 0,
+    active: [],
+    pending: [],
+    next_id: 1,
+    total: 0,
+    injected_total: 0,
+    intercept_enabled: true,
+    recording: false,
+    id_stride: 1,
+    pending_total_delta: 0,
+    pending_injected_delta: 0,
+    db_count: 0,
+    flush_ticks: 0,
+    summary_cache: [],
+    insert_stmt: None,
+    update_stat_stmt: None,
+    add_stat_stmt: None,
+    evict_stmt: None,
+    find_stmt: None,
+    detail_stmt: None,
+  }
+}
+
+///|
 /// Open a SQLite database at `path` (or `:memory:`) and prepare the schema.
 /// Returns `None` when the database cannot be opened/initialised, so callers
 /// can fall back to an in-memory store instead of taking the proxy down.
-fn open_store(path : String, dir : String, capacity : Int32) -> FlowStore? {
+fn open_store(
+  path : String,
+  dir : String,
+  capacity : Int32,
+  worker_id : Int32,
+  workers : Int32,
+) -> FlowStore? {
   let db = @sqlite.SqliteDriver::open(path) catch {
     e => {
       println("[monitor] cannot open " + path + ": " + e.to_string())
       return None
     }
   }
+  let stride = if workers > 1 { workers } else { 1 }
   let store : FlowStore = {
     db,
     dir,
@@ -179,15 +253,89 @@ fn open_store(path : String, dir : String, capacity : Int32) -> FlowStore? {
     total: 0,
     injected_total: 0,
     intercept_enabled: true,
+    recording: true,
+    id_stride: stride,
+    pending_total_delta: 0,
+    pending_injected_delta: 0,
+    db_count: 0,
+    flush_ticks: 0,
+    summary_cache: [],
+    insert_stmt: None,
+    update_stat_stmt: None,
+    add_stat_stmt: None,
+    evict_stmt: None,
+    find_stmt: None,
+    detail_stmt: None,
   }
   if !store.init_schema() {
     store.db.close()
     return None
   }
+  store.prepare_statements()
   store.load_meta()
-  store.mark_stale_pending()
-  store.evict()
+  if stride > 1 {
+    // Disjoint ID lanes across worker processes: worker k gets ids congruent
+    // to (k + 1) mod stride so concurrent WAL writers never collide on PK.
+    let offset = if worker_id >= 0 { worker_id % stride } else { 0 }
+    let base = store.next_id
+    let rem = (base - 1) % stride
+    let adjust = (offset - rem + stride) % stride
+    store.next_id = base + adjust
+  }
+  if worker_id == 0 {
+    store.mark_stale_pending()
+    store.evict()
+  }
+  store.load_summary_cache()
   Some(store)
+}
+
+///|
+fn FlowStore::prepare_statements(self : FlowStore) -> Unit {
+  self.insert_stmt = Some(self.db.prepare(insert_flow_sql)) catch { _ => None }
+  self.update_stat_stmt = Some(
+    self.db.prepare("UPDATE stats SET value = ? WHERE key = ?"),
+  ) catch {
+    _ => None
+  }
+  self.add_stat_stmt = Some(
+    self.db.prepare("UPDATE stats SET value = value + ? WHERE key = ?"),
+  ) catch {
+    _ => None
+  }
+  self.evict_stmt = Some(
+    self.db.prepare(
+      "DELETE FROM flows WHERE id IN (SELECT id FROM flows ORDER BY id ASC LIMIT ?)",
+    ),
+  ) catch {
+    _ => None
+  }
+  self.find_stmt = Some(self.db.prepare(find_flow_sql)) catch { _ => None }
+  self.detail_stmt = Some(self.db.prepare(detail_flow_sql)) catch { _ => None }
+}
+
+///|
+fn FlowStore::close_statements(self : FlowStore) -> Unit {
+  for
+    s in [
+      self.insert_stmt,
+      self.update_stat_stmt,
+      self.add_stat_stmt,
+      self.evict_stmt,
+      self.find_stmt,
+      self.detail_stmt,
+    ] {
+    match s {
+      Some(stmt) => stmt.close()
+      None => ()
+    }
+  }
+  self.insert_stmt = None
+  self.update_stat_stmt = None
+  self.add_stat_stmt = None
+  self.evict_stmt = None
+  self.find_stmt = None
+  self.detail_stmt = None
 }
 
 ///|
@@ -208,12 +356,58 @@ fn FlowStore::init_schema(self : FlowStore) -> Bool {
 fn FlowStore::load_meta(self : FlowStore) -> Unit {
   self.total = self.read_stat("total")
   self.injected_total = self.read_stat("injected_total")
-  let rows = self.rows("SELECT COALESCE(MAX(id), 0) + 1 FROM flows", [])
+  let rows = self.rows("SELECT COALESCE(MAX(id), 0) + 1, COUNT(*) FROM flows", [])
   if rows.length() > 0 {
     self.next_id = row_int(rows[0], 0)
+    self.db_count = row_int(rows[0], 1)
   } else {
     self.next_id = 1
+    self.db_count = 0
   }
+}
+
+///|
+/// Populate the in-memory summary cache from persisted rows at startup.
+fn FlowStore::load_summary_cache(self : FlowStore) -> Unit {
+  let limit_clause = if self.capacity > 0 {
+    " LIMIT " + self.capacity.to_string()
+  } else {
+    ""
+  }
+  let rows = self.rows(
+    "SELECT id, start_ms, method, target, status, reason, intercepted, " +
+    "injected, finished, error, request_size, response_size, end_ms, " +
+    "content_type FROM flows ORDER BY id DESC" +
+    limit_clause,
+    [],
+  )
+  let out : Array[@shared.FlowSummary] = []
+  for row in rows {
+    let start_ms = row_int64(row, 1)
+    let end_ms = row_int64(row, 12)
+    let status = row_int(row, 4)
+    let error = if row_is_null(row, 9) { None } else { Some(row_text(row, 9)) }
+    out.push({
+      id: row_int(row, 0),
+      start_ms: start_ms.to_double(),
+      http_method: row_text(row, 2),
+      path: row_text(row, 3),
+      status,
+      reason: row_text(row, 5),
+      intercepted: row_int(row, 6) != 0,
+      injected: row_int(row, 7) != 0,
+      pending: row_int(row, 8) == 0,
+      error,
+      req_size: row_int(row, 10),
+      resp_size: row_int(row, 11),
+      duration_ms: duration_between(
+        start_ms.reinterpret_as_uint64(),
+        end_ms.reinterpret_as_uint64(),
+      ),
+      content_type: row_text(row, 13),
+    })
+  }
+  self.summary_cache = out
 }
 
 ///|
@@ -275,6 +469,8 @@ fn FlowStore::rows(
 pub async fn FlowStore::open(
   dir : String,
   capacity~ : Int32 = default_flow_capacity,
+  worker_id~ : Int32 = 0,
+  workers~ : Int32 = 1,
 ) -> FlowStore {
   if dir.is_empty() {
     return FlowStore::new(capacity~)
@@ -284,7 +480,7 @@ pub async fn FlowStore::open(
       println("[monitor] cannot create data dir " + dir + ": " + e.to_string())
   }
   let path = dir + "/monitor.sqlite"
-  match open_store(path, dir, capacity) {
+  match open_store(path, dir, capacity, worker_id, workers) {
     Some(store) => {
       // The database and its WAL/SHM companions all carry captured API keys.
       for suffix in ["", "-wal", "-shm"] {
@@ -305,7 +501,7 @@ pub async fn FlowStore::open(
 /// In-memory store (tests, and the fallback when the temp directory is not
 /// writable). Same schema and SQL as the file-backed store.
 pub fn FlowStore::new(capacity~ : Int32 = default_flow_capacity) -> FlowStore {
-  match open_store(":memory:", "", capacity) {
+  match open_store(":memory:", "", capacity, 0, 1) {
     Some(store) => store
     None => panic()
   }
@@ -315,12 +511,12 @@ pub fn FlowStore::new(capacity~ : Int32 = default_flow_capacity) -> FlowStore {
 /// Close the underlying database (mainly for tests and orderly shutdown).
 pub fn FlowStore::close(self : FlowStore) -> Unit {
   self.flush_pending()
+  self.close_statements()
   self.db.close()
 }
 
 ///|
-/// Register a new flow (request fully read, response pending). The row is
-/// inserted immediately so a crash leaves a visible (stale) record.
+/// Register a new flow (request fully read, response pending).
 pub fn FlowStore::begin(
   self : FlowStore,
   client_addr~ : String,
@@ -331,6 +527,34 @@ pub fn FlowStore::begin(
   intercepted~ : Bool,
   upstream~ : String,
 ) -> Flow {
+  if !self.recording {
+    return {
+      id: 0,
+      start_ms: 0UL,
+      client_addr: "",
+      http_method: "",
+      target: "",
+      request_headers: [],
+      request_size: 0,
+      intercepted: false,
+      upstream: "",
+      request_body: empty_bytes,
+      request_truncated: false,
+      injected: false,
+      upstream_body: None,
+      upstream_truncated: false,
+      status: 0,
+      reason: "",
+      response_headers: [],
+      response_body: empty_bytes,
+      response_size: 0,
+      response_truncated: false,
+      end_ms: 0UL,
+      error: None,
+      finished: true,
+      persisted: true,
+    }
+  }
   let (body, truncated) = cap_bytes(request_body)
   let flow : Flow = {
     id: self.next_id,
@@ -350,7 +574,7 @@ pub fn FlowStore::begin(
     status: 0,
     reason: "",
     response_headers: [],
-    response_body: @utf8.encode(""),
+    response_body: empty_bytes,
     response_size: 0,
     response_truncated: false,
     end_ms: 0UL,
@@ -358,17 +582,18 @@ pub fn FlowStore::begin(
     finished: false,
     persisted: false,
   }
-  self.next_id += 1
+  self.next_id += self.id_stride
   self.total += 1
+  self.pending_total_delta += 1
   // Hot path: no SQL here. The row is batched to SQLite by the flusher.
   self.active.push(flow)
   flow
 }
 
 ///|
-/// Mark a flow complete (idempotent), update its row and release bodies.
+/// Mark a flow complete (idempotent) and queue it for batched persistence.
 pub fn FlowStore::finish(self : FlowStore, flow : Flow) -> Unit {
-  if flow.finished {
+  if !self.recording || flow.finished {
     return
   }
   flow.finished = true
@@ -379,102 +604,305 @@ pub fn FlowStore::finish(self : FlowStore, flow : Flow) -> Unit {
   }
   if flow.injected {
     self.injected_total += 1
+    self.pending_injected_delta += 1
   }
   // Hot path: queue for batched persistence; bodies stay in memory until the
   // flusher writes them in a single transaction.
   self.pending.push(flow)
+  // Guard memory under extreme bursts: if pending grows past 2x capacity before
+  // the next flush tick, drop the oldest excess flows right away (they would be
+  // evicted immediately on flush anyway).
+  if self.capacity > 0 && self.pending.length() >= self.capacity * 2 {
+    self.pending.sort_by((a, b) => a.id - b.id)
+    let drop_n = self.pending.length() - self.capacity
+    let kept : Array[Flow] = Array(capacity=self.capacity)
+    for i = 0; i < drop_n; i = i + 1 {
+      let old = self.pending[i]
+      old.request_body = empty_bytes
+      old.upstream_body = None
+      old.response_body = empty_bytes
+    }
+    for i = drop_n; i < self.pending.length(); i = i + 1 {
+      kept.push(self.pending[i])
+    }
+    self.pending = kept
+  }
 }
 
 ///|
-/// Write all finished-but-unpersisted flows in ONE transaction (single WAL
-/// commit), sync counters, and evict beyond capacity. Called by the background
-/// flusher; also safe to call synchronously (tests / shutdown).
+fn FlowStore::insert_flow_row(self : FlowStore, flow : Flow) -> Unit {
+  let values : Array[@moondb.Value] = [
+    @moondb.Int(flow.id),
+    @moondb.Int64(flow.start_ms.reinterpret_as_int64()),
+    @moondb.Text(flow.client_addr),
+    @moondb.Text(flow.http_method),
+    @moondb.Text(flow.target),
+    @moondb.Text(headers_to_text(flow.request_headers)),
+    @moondb.Blob(flow.request_body),
+    @moondb.Int(flow.request_size),
+    @moondb.Int(bool_int(flow.request_truncated)),
+    @moondb.Int(bool_int(flow.intercepted)),
+    @moondb.Text(flow.upstream),
+    @moondb.Int(bool_int(flow.injected)),
+    match flow.upstream_body {
+      Some(body) => @moondb.Blob(body)
+      None => @moondb.Null
+    },
+    @moondb.Int(bool_int(flow.upstream_truncated)),
+    @moondb.Int(flow.status),
+    @moondb.Text(flow.reason),
+    @moondb.Text(headers_to_text(flow.response_headers)),
+    @moondb.Blob(flow.response_body),
+    @moondb.Int(flow.response_size),
+    @moondb.Int(bool_int(flow.response_truncated)),
+    @moondb.Int64(flow.end_ms.reinterpret_as_int64()),
+    match flow.error {
+      Some(msg) => @moondb.Text(msg)
+      None => @moondb.Null
+    },
+    @moondb.Int(1),
+    @moondb.Text(content_type(flow.response_headers)),
+  ]
+  try {
+    match self.insert_stmt {
+      Some(stmt) => {
+        stmt.bind(values)
+        stmt.execute() |> ignore
+      }
+      None => self.db.execute(insert_flow_sql, values) |> ignore
+    }
+  } catch {
+    e =>
+      println(
+        "[monitor] cannot insert flow #" +
+        flow.id.to_string() +
+        ": " +
+        e.to_string(),
+      )
+  }
+}
+
+///|
+fn FlowStore::write_stat(self : FlowStore, key : String, value : Int32) -> Unit {
+  try {
+    match self.update_stat_stmt {
+      Some(stmt) => {
+        stmt.bind([@moondb.Int(value), @moondb.Text(key)])
+        stmt.execute() |> ignore
+      }
+      None =>
+        self.db.execute("UPDATE stats SET value = ? WHERE key = ?", [
+          @moondb.Int(value),
+          @moondb.Text(key),
+        ])
+        |> ignore
+    }
+  } catch {
+    e => println("[monitor] sqlite stat update failed: " + e.to_string())
+  }
+}
+
+///|
+fn FlowStore::add_stat(self : FlowStore, key : String, delta : Int32) -> Unit {
+  if delta == 0 {
+    return
+  }
+  try {
+    match self.add_stat_stmt {
+      Some(stmt) => {
+        stmt.bind([@moondb.Int(delta), @moondb.Text(key)])
+        stmt.execute() |> ignore
+      }
+      None =>
+        self.db.execute("UPDATE stats SET value = value + ? WHERE key = ?", [
+          @moondb.Int(delta),
+          @moondb.Text(key),
+        ])
+        |> ignore
+    }
+  } catch {
+    e => println("[monitor] sqlite stat increment failed: " + e.to_string())
+  }
+}
+
+///|
+fn FlowStore::delete_oldest_rows(self : FlowStore, count : Int32) -> Int32 {
+  if count <= 0 {
+    return 0
+  }
+  try {
+    let res = match self.evict_stmt {
+      Some(stmt) => {
+        stmt.bind([@moondb.Int(count)])
+        stmt.execute()
+      }
+      None =>
+        self.db.execute(
+          "DELETE FROM flows WHERE id IN (SELECT id FROM flows ORDER BY id ASC LIMIT ?)",
+          [@moondb.Int(count)],
+        )
+    }
+    res.rows_affected.to_int()
+  } catch {
+    e => {
+      println("[monitor] sqlite evict failed: " + e.to_string())
+      0
+    }
+  }
+}
+
+///|
+/// Write all surviving finished flows, update stats, and evict beyond capacity
+/// in ONE single SQLite transaction (1 WAL commit, reusing prepared statements).
+/// Flows that would be immediately evicted are discarded before touching SQLite.
 pub fn FlowStore::flush_pending(self : FlowStore) -> Unit {
-  if self.pending.length() == 0 {
+  if !self.recording || self.pending.length() == 0 {
     return
   }
   let batch = self.pending
   self.pending = []
-  self.exec("BEGIN") |> ignore
-  for flow in batch {
-    let values : Array[@moondb.Value] = [
-      @moondb.Int(flow.id),
-      @moondb.Int64(flow.start_ms.reinterpret_as_int64()),
-      @moondb.Text(flow.client_addr),
-      @moondb.Text(flow.http_method),
-      @moondb.Text(flow.target),
-      @moondb.Text(headers_to_text(flow.request_headers)),
-      @moondb.Blob(flow.request_body),
-      @moondb.Int(flow.request_size),
-      @moondb.Int(bool_int(flow.request_truncated)),
-      @moondb.Int(bool_int(flow.intercepted)),
-      @moondb.Text(flow.upstream),
-      @moondb.Int(bool_int(flow.injected)),
-      match flow.upstream_body {
-        Some(body) => @moondb.Blob(body)
-        None => @moondb.Null
-      },
-      @moondb.Int(bool_int(flow.upstream_truncated)),
-      @moondb.Int(flow.status),
-      @moondb.Text(flow.reason),
-      @moondb.Text(headers_to_text(flow.response_headers)),
-      @moondb.Blob(flow.response_body),
-      @moondb.Int(flow.response_size),
-      @moondb.Int(bool_int(flow.response_truncated)),
-      @moondb.Int64(flow.end_ms.reinterpret_as_int64()),
-      match flow.error {
-        Some(msg) => @moondb.Text(msg)
-        None => @moondb.Null
-      },
-      @moondb.Int(1),
-      @moondb.Text(content_type(flow.response_headers)),
-    ]
-    try self.db.execute(insert_flow_sql, values) |> ignore catch {
-      e =>
-        println(
-          "[monitor] cannot insert flow #" +
-          flow.id.to_string() +
-          ": " +
-          e.to_string(),
-        )
+  let keep = if self.capacity > 0 {
+    let k = self.capacity - self.active.length()
+    if k > 0 {
+      k
+    } else {
+      0
+    }
+  } else {
+    self.db_count + batch.length()
+  }
+  let mut skip = 0
+  if self.capacity > 0 && batch.length() > keep {
+    if keep > 0 {
+      batch.sort_by((a, b) => a.id - b.id)
+    }
+    skip = batch.length() - keep
+    for i = 0; i < skip; i = i + 1 {
+      let dropped = batch[i]
+      dropped.request_body = empty_bytes
+      dropped.upstream_body = None
+      dropped.response_body = empty_bytes
+    }
+  }
+  let new_summaries : Array[@shared.FlowSummary] = Array(
+    capacity=batch.length() - skip,
+  )
+  let mut deleted_any = false
+  let began = try {
+    self.db.begin()
+    true
+  } catch {
+    e => {
+      println("[monitor] sqlite begin failed: " + e.to_string())
+      false
+    }
+  }
+  for i = skip; i < batch.length(); i = i + 1 {
+    let flow = batch[i]
+    self.insert_flow_row(flow)
+    self.db_count += 1
+    if self.id_stride == 1 {
+      new_summaries.push(flow.summary())
     }
     flow.persisted = true
-    flow.request_body = @utf8.encode("")
+    flow.request_body = empty_bytes
     flow.upstream_body = None
-    flow.response_body = @utf8.encode("")
+    flow.response_body = empty_bytes
   }
-  self.exec("COMMIT") |> ignore
-  self.exec(
-    "UPDATE stats SET value = " +
-    self.total.to_string() +
-    " WHERE key = 'total'",
-  )
-  |> ignore
-  self.exec(
-    "UPDATE stats SET value = " +
-    self.injected_total.to_string() +
-    " WHERE key = 'injected_total'",
-  )
-  |> ignore
-  self.evict()
+  if self.id_stride > 1 {
+    let d_total = self.pending_total_delta
+    let d_inj = self.pending_injected_delta
+    self.pending_total_delta = 0
+    self.pending_injected_delta = 0
+    self.add_stat("total", d_total)
+    self.add_stat("injected_total", d_inj)
+    if self.capacity > 0 {
+      let total_rows = match self.rows("SELECT COUNT(*) FROM flows", []) {
+        [row] => row_int(row, 0)
+        _ => self.db_count
+      }
+      if total_rows > keep {
+        let removed = self.delete_oldest_rows(total_rows - keep)
+        self.db_count = total_rows - removed
+        deleted_any = removed > 0
+      } else {
+        self.db_count = total_rows
+      }
+    }
+  } else {
+    self.pending_total_delta = 0
+    self.pending_injected_delta = 0
+    self.write_stat("total", self.total)
+    self.write_stat("injected_total", self.injected_total)
+    if self.capacity > 0 && self.db_count > keep {
+      if keep == 0 {
+        self.exec("DELETE FROM flows") |> ignore
+        self.db_count = 0
+        self.summary_cache = []
+        deleted_any = true
+      } else {
+        let over = self.db_count - keep
+        let removed = self.delete_oldest_rows(over)
+        self.db_count = if self.db_count > removed {
+          self.db_count - removed
+        } else {
+          0
+        }
+        deleted_any = removed > 0
+      }
+    }
+  }
+  if began {
+    self.db.commit() catch {
+      e => println("[monitor] sqlite commit failed: " + e.to_string())
+    }
+  }
+  if self.id_stride == 1 {
+    if new_summaries.length() > 0 {
+      for s in new_summaries {
+        self.summary_cache.push(s)
+      }
+      self.summary_cache.sort_by((a, b) => b.id - a.id)
+    }
+    if self.capacity > 0 && self.summary_cache.length() > keep {
+      self.summary_cache.truncate(keep)
+    }
+  }
+  // Periodically reclaim free pages in incremental chunks so disk usage stays
+  // bounded without relocating pages on every flush.
+  if deleted_any && !self.dir.is_empty() {
+    self.flush_ticks += 1
+    if self.flush_ticks >= 32 {
+      self.flush_ticks = 0
+      self.exec("PRAGMA incremental_vacuum(64)") |> ignore
+    }
+  }
 }
 
 ///|
-/// Background flusher: batch-persist finished flows every ~20ms so the proxy
+/// Background flusher: batch-persist finished flows every ~50ms so the proxy
 /// hot path never waits on SQLite and tail-latency spikes stay small.
 pub async fn FlowStore::run_flusher(self : FlowStore) -> Unit {
+  if !self.recording {
+    return
+  }
   for ;; {
-    @async.sleep(20)
+    @async.sleep(flush_interval_ms)
     self.flush_pending()
   }
 }
 
 ///|
 fn FlowStore::take_active(self : FlowStore, id : Int32) -> Bool {
+  let len = self.active.length()
   let mut i = 0
-  while i < self.active.length() {
+  while i < len {
     if self.active[i].id == id {
-      self.active.remove(i) |> ignore
+      let last = len - 1
+      if i != last {
+        self.active[i] = self.active[last]
+      }
+      self.active.pop() |> ignore
       return true
     }
     i += 1
@@ -485,29 +913,47 @@ fn FlowStore::take_active(self : FlowStore, id : Int32) -> Bool {
 ///|
 /// Keep only the newest `capacity` flows across memory (active+pending) and
 /// SQLite. In-flight (active) flows are never dropped; oldest pending then
-/// oldest persisted rows are evicted first. `auto_vacuum` reclaims pages.
+/// oldest persisted rows are evicted first.
 fn FlowStore::evict(self : FlowStore) -> Unit {
-  if self.capacity <= 0 {
+  if !self.recording || self.capacity <= 0 {
     return
-  }
-  let db_count = match self.rows("SELECT COUNT(*) FROM flows", []) {
-    [row] => row_int(row, 0)
-    _ => 0
   }
   let mut over = self.active.length() +
     self.pending.length() +
-    db_count -
+    self.db_count -
     self.capacity
-  while over > 0 && self.pending.length() > 0 {
-    self.pending.remove(0) |> ignore
-    over -= 1
+  if over <= 0 {
+    return
   }
-  while over > 0 {
-    self.exec(
-      "DELETE FROM flows WHERE id = (SELECT id FROM flows ORDER BY id ASC LIMIT 1)",
-    )
-    |> ignore
-    over -= 1
+  if self.pending.length() > 0 {
+    let drop_p = if over < self.pending.length() {
+      over
+    } else {
+      self.pending.length()
+    }
+    if drop_p == self.pending.length() {
+      self.pending = []
+    } else {
+      let kept : Array[Flow] = Array(capacity=self.pending.length() - drop_p)
+      for i = drop_p; i < self.pending.length(); i = i + 1 {
+        kept.push(self.pending[i])
+      }
+      self.pending = kept
+    }
+    over -= drop_p
+  }
+  if over > 0 {
+    let removed = self.delete_oldest_rows(over)
+    self.db_count = if self.db_count > removed {
+      self.db_count - removed
+    } else {
+      0
+    }
+    let keep = self.capacity - self.active.length() - self.pending.length()
+    let keep = if keep > 0 { keep } else { 0 }
+    if self.summary_cache.length() > keep {
+      self.summary_cache.truncate(keep)
+    }
   }
 }
 
@@ -516,9 +962,14 @@ fn FlowStore::evict(self : FlowStore) -> Unit {
 pub fn FlowStore::clear(self : FlowStore) -> Unit {
   self.active = []
   self.pending = []
+  self.summary_cache = []
+  self.db_count = 0
   self.total = 0
   self.injected_total = 0
   self.next_id = 1
+  if !self.recording {
+    return
+  }
   self.exec("DELETE FROM flows") |> ignore
   self.exec("UPDATE stats SET value = 0") |> ignore
   self.exec("VACUUM") |> ignore
@@ -526,6 +977,9 @@ pub fn FlowStore::clear(self : FlowStore) -> Unit {
 
 ///|
 pub fn FlowStore::find(self : FlowStore, id : Int32) -> Flow? {
+  if !self.recording {
+    return None
+  }
   for flow in self.active {
     if flow.id == id {
       return Some(flow)
@@ -536,7 +990,19 @@ pub fn FlowStore::find(self : FlowStore, id : Int32) -> Flow? {
       return Some(flow)
     }
   }
-  let rows = self.rows(find_flow_sql, [@moondb.Int(id)])
+  let rows = match self.find_stmt {
+    Some(stmt) =>
+      try {
+        stmt.bind([@moondb.Int(id)])
+        stmt.query()
+      } catch {
+        e => {
+          println("[monitor] sqlite find failed: " + e.to_string())
+          []
+        }
+      }
+    None => self.rows(find_flow_sql, [@moondb.Int(id)])
+  }
   if rows.length() == 0 {
     return None
   }
@@ -554,7 +1020,7 @@ pub fn FlowStore::find(self : FlowStore, id : Int32) -> Flow? {
     request_size: row_int(row, 5),
     intercepted: row_int(row, 6) != 0,
     upstream: row_text(row, 7),
-    request_body: @utf8.encode(""),
+    request_body: empty_bytes,
     request_truncated: row_int(row, 8) != 0,
     injected: row_int(row, 9) != 0,
     upstream_body: None,
@@ -562,7 +1028,7 @@ pub fn FlowStore::find(self : FlowStore, id : Int32) -> Flow? {
     status: row_int(row, 11),
     reason: row_text(row, 14),
     response_headers: headers_from_text(row_text(row, 15)),
-    response_body: @utf8.encode(""),
+    response_body: empty_bytes,
     response_size: row_int(row, 16),
     response_truncated: row_int(row, 17) != 0,
     end_ms: row_int64(row, 18).reinterpret_as_uint64(),
@@ -576,6 +1042,9 @@ pub fn FlowStore::find(self : FlowStore, id : Int32) -> Flow? {
 /// Full detail of one flow: from memory while it is in flight, from SQLite
 /// once it has been persisted.
 pub fn FlowStore::detail(self : FlowStore, id : Int32) -> @shared.FlowDetail? {
+  if !self.recording {
+    return None
+  }
   for flow in self.active {
     if flow.id == id {
       return Some(flow.detail())
@@ -586,7 +1055,19 @@ pub fn FlowStore::detail(self : FlowStore, id : Int32) -> @shared.FlowDetail? {
       return Some(flow.detail())
     }
   }
-  let rows = self.rows(detail_flow_sql, [@moondb.Int(id)])
+  let rows = match self.detail_stmt {
+    Some(stmt) =>
+      try {
+        stmt.bind([@moondb.Int(id)])
+        stmt.query()
+      } catch {
+        e => {
+          println("[monitor] sqlite detail failed: " + e.to_string())
+          []
+        }
+      }
+    None => self.rows(detail_flow_sql, [@moondb.Int(id)])
+  }
   if rows.length() == 0 {
     return None
   }
@@ -643,40 +1124,24 @@ pub fn FlowStore::detail(self : FlowStore, id : Int32) -> @shared.FlowDetail? {
 }
 
 ///|
-/// Flow list API payload (newest first, shared contract type).
+/// Flow list API payload (newest first, shared contract type). In single-worker
+/// mode this is served entirely from the in-memory summary cache + active/pending
+/// queues (zero SQLite I/O); in multi-worker mode it reads the shared WAL DB so
+/// the UI displays flows from all workers.
 pub fn FlowStore::list_response(self : FlowStore) -> @shared.FlowsResponse {
-  let rows = self.rows(
-    "SELECT id, start_ms, method, target, status, reason, intercepted, " +
-    "injected, finished, error, request_size, response_size, end_ms, " +
-    "content_type FROM flows ORDER BY id DESC LIMIT " +
-    self.capacity.to_string(),
-    [],
+  if self.id_stride > 1 && self.recording {
+    self.load_summary_cache()
+    self.total = self.read_stat("total") + self.pending_total_delta
+    self.injected_total = self.read_stat("injected_total") +
+      self.pending_injected_delta
+  }
+  let flows : Array[@shared.FlowSummary] = Array(
+    capacity=self.summary_cache.length() +
+      self.pending.length() +
+      self.active.length(),
   )
-  let flows : Array[@shared.FlowSummary] = []
-  for row in rows {
-    let start_ms = row_int64(row, 1)
-    let end_ms = row_int64(row, 12)
-    let status = row_int(row, 4)
-    let error = if row_is_null(row, 9) { None } else { Some(row_text(row, 9)) }
-    flows.push({
-      id: row_int(row, 0),
-      start_ms: start_ms.to_double(),
-      http_method: row_text(row, 2),
-      path: row_text(row, 3),
-      status,
-      reason: row_text(row, 5),
-      intercepted: row_int(row, 6) != 0,
-      injected: row_int(row, 7) != 0,
-      pending: row_int(row, 8) == 0,
-      error,
-      req_size: row_int(row, 10),
-      resp_size: row_int(row, 11),
-      duration_ms: duration_between(
-        start_ms.reinterpret_as_uint64(),
-        end_ms.reinterpret_as_uint64(),
-      ),
-      content_type: row_text(row, 13),
-    })
+  for s in self.summary_cache {
+    flows.push(s)
   }
   // Include not-yet-persisted (pending) and in-flight (active) flows so the
   // list is complete even between flusher ticks.
@@ -724,7 +1189,7 @@ fn row_text(row : @moondb.Row, index : Int32) -> String {
 ///|
 fn row_blob(row : @moondb.Row, index : Int32) -> Bytes {
   row.blob(index) catch {
-    _ => @utf8.encode("")
+    _ => empty_bytes
   }
 }
 
@@ -757,11 +1222,17 @@ fn duration_between(start_ms : UInt64, end_ms : UInt64) -> Int32 {
 /// Serialize headers as `name: value\n` lines (HTTP header values cannot
 /// contain newlines, so this round-trips safely).
 fn headers_to_text(headers : Array[(String, String)]) -> String {
-  let mut out = ""
-  for pair in headers {
-    out = out + pair.0 + ": " + pair.1 + "\n"
+  if headers.is_empty() {
+    return ""
   }
-  out
+  let sb = StringBuilder(capacity=256)
+  for pair in headers {
+    sb.write_string(pair.0)
+    sb.write_string(": ")
+    sb.write_string(pair.1)
+    sb.write_char('\n')
+  }
+  sb.to_string()
 }
 
 ///|

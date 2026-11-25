@@ -175,3 +175,37 @@ test "monitor: intercept switch defaults on and toggles at runtime" {
   assert_true(store.list_response().intercept_enabled)
   store.close()
 }
+
+///|
+test "flow: disabled store skips recording while preserving intercept switch" {
+  let store = FlowStore::disabled()
+  assert_true(!store.is_recording())
+  assert_true(store.intercept_enabled())
+  store.set_intercept_enabled(false)
+  assert_true(!store.intercept_enabled())
+  let f = begin_test_flow(store, "/noop")
+  store.finish(f)
+  store.flush_pending()
+  assert_eq(store.list_response().stored, 0)
+  store.close()
+}
+
+///|
+test "flow: burst flush pre-drops oldest excess beyond capacity" {
+  let store = FlowStore::new(capacity=3)
+  for i = 0; i < 8; i = i + 1 {
+    let f = begin_test_flow(store, "/p" + i.to_string())
+    f.status = 200
+    store.finish(f)
+  }
+  store.flush_pending()
+  let list = store.list_response()
+  assert_eq(list.total, 8)
+  assert_eq(list.stored, 3)
+  assert_eq(list.flows[0].id, 8)
+  assert_eq(list.flows[1].id, 7)
+  assert_eq(list.flows[2].id, 6)
+  assert_true(store.find(5) is None)
+  assert_true(store.find(6) is Some(_))
+  store.close()
+}

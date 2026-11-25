@@ -2,8 +2,17 @@
 /// Rendering of the monitor UI (rabbita html combinators).
 
 ///|
+/// Cached Intl.DateTimeFormat avoids creating a fresh formatter 200x per 1.5s tick.
 extern "js" fn locale_time(ms : Double) -> String =
-  #|(ms) => new Date(ms).toLocaleTimeString("zh-CN", { hour12: false })
+  #|(() => {
+  #|  const fmt = new Intl.DateTimeFormat("zh-CN", {
+  #|    hour12: false,
+  #|    hour: "2-digit",
+  #|    minute: "2-digit",
+  #|    second: "2-digit",
+  #|  });
+  #|  return (ms) => fmt.format(ms);
+  #|})()
 
 ///|
 fn fmt_size(n : Int32) -> String {
@@ -224,25 +233,18 @@ fn detail_view(model : Model, emit : @rabbita.Emit[Msg]) -> @html.Html {
             @html.nothing
           },
         ]),
-        pane(d, model.tab),
+        pane(d, model),
       ])
   }
 }
 
 ///|
-fn pane(d : @shared.FlowDetail, tab : Tab) -> @html.Html {
-  match tab {
-    RequestTab =>
-      request_pane(
-        d.request,
-        d.request.body,
-        d.request.truncated,
-        header_value(d.request.headers, "content-type"),
-      )
+fn pane(d : @shared.FlowDetail, model : Model) -> @html.Html {
+  match model.tab {
+    RequestTab => request_pane(d.request, model.pretty_req, d.request.truncated)
     InjectedTab =>
       match d.upstream_request {
-        Some(u) =>
-          request_pane(d.request, u.body, u.truncated, "application/json")
+        Some(u) => request_pane(d.request, model.pretty_upstream, u.truncated)
         None => @html.nothing
       }
     ResponseTab =>
@@ -263,12 +265,7 @@ fn pane(d : @shared.FlowDetail, tab : Tab) -> @html.Html {
               @html.text("HTTP/1.1 \{r.status} \{r.reason}"),
             ]),
             headers_table(r.headers),
-            body_block(
-              r.body,
-              r.truncated,
-              header_value(r.headers, "content-type"),
-              r.size,
-            ),
+            body_block(model.pretty_resp, r.truncated, r.size),
           ])
       }
   }
@@ -277,16 +274,15 @@ fn pane(d : @shared.FlowDetail, tab : Tab) -> @html.Html {
 ///|
 fn request_pane(
   req : @shared.RequestData,
-  body : String,
+  formatted_body : String,
   truncated : Bool,
-  ct : String,
 ) -> @html.Html {
   @html.fragment([
     @html.div(class="line", [
       @html.text("\{req.http_method} \{req.target} HTTP/1.1"),
     ]),
     headers_table(req.headers),
-    body_block(body, truncated, ct, req.size),
+    body_block(formatted_body, truncated, req.size),
   ])
 }
 
@@ -308,9 +304,8 @@ fn headers_table(headers : Array[(String, String)]) -> @html.Html {
 
 ///|
 fn body_block(
-  body : String,
+  formatted_body : String,
   truncated : Bool,
-  ct : String,
   size : Int32,
 ) -> @html.Html {
   @html.fragment([
@@ -320,6 +315,6 @@ fn body_block(
         (if truncated { " · 已截断，仅保存前 256 KiB" } else { "" }),
       ),
     ]),
-    @html.pre([@html.text(pretty(body, ct))]),
+    @html.pre([@html.text(formatted_body)]),
   ])
 }

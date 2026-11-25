@@ -1,12 +1,18 @@
 // Generated using `moon info`, DON'T EDIT IT
 package "1123Javayanglei/vscode-chat-proxy/internal/httpparse"
 
+import {
+  "moonbitlang/core/buffer",
+}
+
 // Values
 pub fn absolute_http_target(String) -> (String, Int32, String)?
 
 pub fn build_upstream_head(RequestHead, String, Int32, Int32, Bool) -> String
 
 pub fn build_upstream_head_keepalive(RequestHead, String, Int32, Int32, Bool) -> String
+
+pub fn contains_ignore_ascii_case(StringView, StringView) -> Bool
 
 pub fn header_value(RequestHead, String) -> String?
 
@@ -16,19 +22,41 @@ pub fn parse_authority(String, Int32) -> (String, Int32)?
 
 pub fn parse_header_line(String) -> (String, String)?
 
+pub fn parse_request_head_block(String) -> (String, String, String, Array[(String, String)], ReqMeta)?
+
 pub fn parse_request_line(String) -> (String, String, String)?
+
+pub fn parse_response_headers_block(StringView) -> (Array[(String, String)], RespMeta)
 
 pub fn parse_status_line(String) -> (Int32, String)?
 
 pub fn target_path(String) -> String
 
+pub fn write_upstream_head_keepalive(@buffer.Buffer, RequestHead, String, Int32, Int32, Bool) -> Unit
+
 // Errors
 
 // Types and methods
+pub(all) struct ReqMeta {
+  host : String?
+  connection : String?
+  upgrade : Bool
+  expect_100 : Bool
+  content_length : Int32?
+  bad_content_length : String?
+  chunked : Bool
+}
+
 pub(all) struct RequestHead {
   http_method : String
   target : String
   headers : Array[(String, String)]
+}
+
+pub(all) struct RespMeta {
+  connection : String?
+  content_length : Int32?
+  chunked : Bool
 }
 
 // Type aliases

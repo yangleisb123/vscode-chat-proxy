@@ -120,3 +120,18 @@ test "config: intercept switch default on, CLI and env toggle" {
   let off2 = parse_config(["prog", "--intercept", "off"], default_config())
   assert_true(off2 is Ok({ intercept: false, .. }))
 }
+
+///|
+test "config: workers option" {
+  assert_eq(default_config().workers, 1)
+  let ok = parse_config(["prog", "--workers", "4"], default_config())
+  assert_true(ok is Ok({ workers: 4, .. }))
+  let ok2 = parse_config(["prog", "-j", "2"], default_config())
+  assert_true(ok2 is Ok({ workers: 2, .. }))
+  assert_true(
+    parse_config(["prog", "--workers", "0"], default_config()) is Err(_),
+  )
+  assert_true(
+    parse_config(["prog", "--workers", "abc"], default_config()) is Err(_),
+  )
+}

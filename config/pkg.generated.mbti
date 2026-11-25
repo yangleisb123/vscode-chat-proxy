@@ -31,6 +31,7 @@ pub(all) struct Config {
   web_port : Int32
   system_prompt : String
   intercept : Bool
+  workers : Int32
 }
 
 // Type aliases

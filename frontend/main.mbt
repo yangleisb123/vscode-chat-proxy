@@ -21,6 +21,12 @@ struct Model {
   capacity : Int32
   selected : Int32?
   detail : @shared.FlowDetail?
+  /// Cached pretty-printed bodies for the currently selected `detail`,
+  /// computed once on `DetailLoaded` instead of re-parsing JSON on every
+  /// 1.5s poll tick or filter keystroke.
+  pretty_req : String
+  pretty_upstream : String
+  pretty_resp : String
   tab : Tab
   filter : String
   paused : Bool
@@ -53,6 +59,9 @@ fn initial_model() -> Model {
     capacity: 0,
     selected: None,
     detail: None,
+    pretty_req: "",
+    pretty_upstream: "",
+    pretty_resp: "",
     tab: RequestTab,
     filter: "",
     paused: false,
@@ -100,6 +109,7 @@ fn update(
             if s.id == id {
               found = true
               pending = s.pending
+              break
             }
           }
           let need_detail = match m.detail {
@@ -107,7 +117,17 @@ fn update(
             Some(d) => d.pending || d.id != id
           }
           if !found {
-            ({ ..m, selected: None, detail: None, }, @rabbita.none)
+            (
+              {
+                ..m,
+                selected: None,
+                detail: None,
+                pretty_req: "",
+                pretty_upstream: "",
+                pretty_resp: "",
+              },
+              @rabbita.none,
+            )
           } else if pending || need_detail {
             (m, fetch_detail(emit, id))
           } else {
@@ -118,11 +138,36 @@ fn update(
       }
     }
     FlowsLoaded(Err(_)) => ({ ..model, offline: true, }, @rabbita.none)
-    DetailLoaded(Ok(d)) => ({ ..model, detail: Some(d), }, @rabbita.none)
+    DetailLoaded(Ok(d)) => {
+      let pretty_req = pretty(
+        d.request.body,
+        header_value(d.request.headers, "content-type"),
+      )
+      let pretty_upstream = match d.upstream_request {
+        Some(u) => pretty(u.body, "application/json")
+        None => ""
+      }
+      let pretty_resp = match d.response {
+        Some(r) => pretty(r.body, header_value(r.headers, "content-type"))
+        None => ""
+      }
+      (
+        { ..model, detail: Some(d), pretty_req, pretty_upstream, pretty_resp, },
+        @rabbita.none,
+      )
+    }
     DetailLoaded(Err(_)) => (model, @rabbita.none)
     Select(id) =>
       (
-        { ..model, selected: Some(id), tab: RequestTab, detail: None, },
+        {
+          ..model,
+          selected: Some(id),
+          tab: RequestTab,
+          detail: None,
+          pretty_req: "",
+          pretty_upstream: "",
+          pretty_resp: "",
+        },
         fetch_detail(emit, id),
       )
     SetTab(t) => ({ ..model, tab: t, }, @rabbita.none)
@@ -131,7 +176,18 @@ fn update(
     Clear =>
       (model, @rhttp.delete("/api/flows").expect_empty(_ => emit(Cleared)))
     Cleared =>
-      ({ ..model, flows: [], selected: None, detail: None, }, fetch_flows(emit))
+      (
+        {
+          ..model,
+          flows: [],
+          selected: None,
+          detail: None,
+          pretty_req: "",
+          pretty_upstream: "",
+          pretty_resp: "",
+        },
+        fetch_flows(emit),
+      )
     ToggleIntercept => {
       let next : @shared.InterceptState = { enabled: !model.intercept_enabled, }
       (

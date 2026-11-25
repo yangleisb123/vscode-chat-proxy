@@ -200,3 +200,96 @@ test "custom prefix: blank falls back to the built-in sentence" {
     ),
   )
 }
+
+///|
+/// Verify byte-level fast path produces semantically identical JSON to full DOM
+/// parse + `ensure_system_prefix_with`.
+fn assert_fast_rewrite_matches_dom(
+  raw : String,
+  prompt : String,
+  expect_modified : Bool,
+) -> Unit raise {
+  let raw_bytes = @utf8.encode(raw)
+  let dom = @json.parse(raw)
+  let dom_mod = @proxy.ensure_system_prefix_with(dom, prompt)
+  assert_eq(dom_mod, expect_modified)
+  match @proxy.rewrite_chat_body_bytes(raw_bytes, prompt) {
+    Ok(Some(out_bytes)) => {
+      assert_true(expect_modified)
+      let got = @json.parse(@utf8.decode(out_bytes))
+      assert_eq(got, dom)
+    }
+    Ok(None) => assert_true(!expect_modified)
+    Err(msg) => fail("unexpected rewrite error: " + msg)
+  }
+}
+
+///|
+test "fast rewrite: matches DOM across common, unicode, multimodal and edge cases" {
+  let p = @proxy.required_prefix
+  // No system message -> insert at front
+  assert_fast_rewrite_matches_dom(
+    "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}", p,
+    true,
+  )
+  // Empty messages array -> insert single system element (no trailing comma)
+  assert_fast_rewrite_matches_dom("{\"model\":\"m\",\"messages\":[]}", p, true)
+  // Already has prefix -> unchanged (zero alloc)
+  assert_fast_rewrite_matches_dom(
+    "{\"messages\":[{\"role\":\"system\",\"content\":\"" +
+    p +
+    " Be concise.\"},{\"role\":\"user\",\"content\":\"hi\"}]}",
+    p,
+    false,
+  )
+  // Leading spaces before prefix -> unchanged
+  assert_fast_rewrite_matches_dom(
+    "{\"messages\":[{\"role\":\"system\",\"content\":\"   " + p + "\"}]}",
+    p,
+    false,
+  )
+  // Leading escaped newline before prefix -> falls back & unchanged
+  assert_fast_rewrite_matches_dom(
+    "{\"messages\":[{\"role\":\"system\",\"content\":\"\\n  " + p + "\"}]}",
+    p,
+    false,
+  )
+  // Existing different system text -> prepended
+  assert_fast_rewrite_matches_dom(
+    "{\"tools\":[{\"type\":\"function\",\"fn\":{\"name\":\"a\"}}],\"messages\":[{\"role\":\"system\",\"content\":\"Be helpful.\\\"quoted\\\"\"},{\"role\":\"user\",\"content\":\"hello\"}],\"stream\":true}",
+    p, true,
+  )
+  // Empty system content -> becomes injected sentence
+  assert_fast_rewrite_matches_dom(
+    "{\"messages\":[{\"role\":\"system\",\"content\":\"\"}]}", p, true,
+  )
+  // Multimodal system content -> fallback matches DOM
+  assert_fast_rewrite_matches_dom(
+    "{\"messages\":[{\"role\":\"system\",\"content\":[{\"type\":\"text\",\"text\":\"be nice\"}]}]}",
+    p, true,
+  )
+  // CJK custom prompt
+  assert_fast_rewrite_matches_dom(
+    "{\"messages\":[{\"role\":\"system\",\"content\":\"你是助手\"}]}", "你是代码审阅助手",
+    true,
+  )
+  assert_fast_rewrite_matches_dom(
+    "{\"messages\":[{\"role\":\"system\",\"content\":\"你是代码审阅助手。其他内容\"}]}",
+    "你是代码审阅助手", false,
+  )
+  // No messages field
+  assert_fast_rewrite_matches_dom("{\"model\":\"m\"}", p, false)
+  // Malformed JSON -> Err
+  assert_true(
+    @proxy.rewrite_chat_body_bytes(@utf8.encode("{\"messages\":["), p) is Err(_),
+  )
+  assert_true(
+    @proxy.rewrite_chat_body_bytes(
+      @utf8.encode(
+        "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}], bad}",
+      ),
+      p,
+    )
+    is Err(_),
+  )
+}

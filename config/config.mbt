@@ -21,6 +21,8 @@ pub(all) struct Config {
   /// Initial value of the interception switch (runtime-toggleable in the
   /// monitor UI). false = pure pass-through proxy.
   intercept : Bool
+  /// Number of worker processes (Linux SO_REUSEPORT load-balancing). Default 1.
+  workers : Int32
 }
 
 ///|
@@ -41,6 +43,7 @@ pub fn default_config() -> Config {
     web_port: 8788,
     system_prompt: default_system_prompt,
     intercept: true,
+    workers: 1,
   }
 }
 
@@ -120,11 +123,29 @@ fn parse_bool_value(v : StringView, default : Bool) -> Bool {
 }
 
 ///|
+/// Parse a positive worker count from an env var, falling back to `default`.
+fn parse_env_workers(name : String, default : Int32) -> Int32 {
+  match @env.get_env_var(name) {
+    Some(s) => {
+      let n = @string.parse_int(s.clamped_view().trim()) catch {
+        _ => return default
+      }
+      if n < 1 || n > 128 {
+        default
+      } else {
+        n
+      }
+    }
+    None => default
+  }
+}
+
+///|
 /// Build the base config from environment variables (call after `load_env`).
 ///
 /// Individual variables: `HOST`, `PORT`, `UPSTREAM_HOST`, `UPSTREAM_PORT`,
-/// `WEB_HOST`, `WEB_PORT`, and `SYSTEM_PROMPT` (the sentence forced to open
-/// the `system` message).
+/// `WEB_HOST`, `WEB_PORT`, `WORKERS`, and `SYSTEM_PROMPT` (the sentence forced
+/// to open the `system` message).
 /// Combined `host:port` variables `VSCODE_CHAT_PROXY_LISTEN` /
 /// `VSCODE_CHAT_PROXY_UPSTREAM` take precedence over the individual ones.
 pub fn config_from_env() -> Config {
@@ -175,6 +196,13 @@ pub fn config_from_env() -> Config {
     intercept: parse_env_bool(
       "INTERCEPT",
       parse_env_bool("VSCODE_CHAT_PROXY_INTERCEPT", cfg.intercept),
+    ),
+  }
+  cfg = {
+    ..cfg,
+    workers: parse_env_workers(
+      "VSCODE_CHAT_PROXY_WORKERS",
+      parse_env_workers("WORKERS", cfg.workers),
     ),
   }
   cfg
@@ -311,6 +339,15 @@ fn parse_config_exn(
             cfg.intercept,
           ),
         }
+      "--workers" | "-j" => {
+        let n = @string.parse_int(value.clamped_view().trim()) catch {
+          _ => raise ConfigError("invalid workers count: " + value)
+        }
+        if n < 1 || n > 128 {
+          raise ConfigError("workers must be between 1 and 128: " + value)
+        }
+        cfg = { ..cfg, workers: n, }
+      }
       _ => raise ConfigError("unknown option: " + name)
     }
     i += 1
