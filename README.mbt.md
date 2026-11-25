@@ -19,20 +19,19 @@
 尽量复用 mooncakes 生态而非自研：监控 Web 服务器用
 [moonback](https://mooncakes.io/docs/moonbitlang/moonback)（路由/响应helpers/连接管理），
 `.env` 解析用 [spectacleCase/dotenv](https://mooncakes.io/docs/spectacleCase/dotenv)，
-监控存储用 [moonsqlite](https://mooncakes.io/docs/moonbitstack/moonsqlite)（自带 SQLite amalgamation，无系统依赖）。
+监控存储采用纯 MoonBit 异步双段顺序追加日志（基于 `moonbitlang/async/fs` 线程池异步写盘，零 C 第三方依赖）。
 
 ## 依赖（mooncakes.io）
 
 | 包 | 用途 |
 |---|---|
-| `moonbitlang/async` | 异步运行时 + TCP socket（代理数据面、SSE 透传） |
+| `moonbitlang/async` | 异步运行时 + TCP socket + 异步文件 I/O（代理数据面、SSE 透传、异步追加日志） |
 | `moonbitlang/moonback` | 监控 Web 服务器：路由（含 `:id` 参数）、JSON/文本响应、连接管理 |
 | `moonbit-community/rabbita` | 监控前端 Elm 架构 UI 框架（js 目标） |
 | `spectacleCase/dotenv` | `.env` 文本解析（引号/export/行内注释/BOM/容错） |
-| `moonbitstack/moonsqlite` | 嵌入式 SQLite（自带 amalgamation，native 目标） |
 
-自研部分只保留生态里没有的：代理数据面（TCP 级转发 + system 前缀注入）、
-流量捕获 SQLite 存储、以及把前端产物内嵌进单二进制的构建脚本。
+自研部分只保留生态里没有的：代理数据面（TCP 级转发 + 字节级 system 前缀注入）、
+异步双段追加流量存储、以及把前端产物内嵌进单二进制的构建脚本。
 
 ## 工作模式：正向代理（默认）与反向代理
 
@@ -188,16 +187,16 @@ curl http://127.0.0.1:8787/v1/chat/completions \
   - **响应（出参）**：状态行、全部响应头、响应体；**SSE 流式响应完整捕获并自动去除 chunked 分块 framing**；
   - **注入后转发体**：被注入前缀的请求额外提供此页签，对比实际发给上游的 body。
 - 进行中的请求（如正在输出的 SSE）实时显示为「进行中」，完成后自动补全出参。
-- 数据落在**系统临时目录**里的单个 SQLite 文件中：
-  - Windows：`%TEMP%\vscode-chat-proxy-monitor-<WEB_PORT>\monitor.sqlite`
-  - macOS / Linux：`$TMPDIR`（未设置时 `/tmp`）`/vscode-chat-proxy-monitor-<WEB_PORT>/monitor.sqlite`
+- 数据落在**系统临时目录**里的双段轮转顺序追加日志文件（`flows.0.log` / `flows.1.log`）：
+  - Windows：`%TEMP%\vscode-chat-proxy-monitor-<WEB_PORT>\flows.{0,1}.log`
+  - macOS / Linux：`$TMPDIR`（未设置时 `/tmp`）`/vscode-chat-proxy-monitor-<WEB_PORT>/flows.{0,1}.log`
   - 可用 `MONITOR_DIR`（或 `VSCODE_CHAT_PROXY_MONITOR_DIR`）覆盖；启动日志会打印实际目录。
-  - 原生目标内嵌 SQLite（`moonbitstack/moonsqlite`，编译进可执行文件），**无需系统安装 SQLite**。
-- 最多保留最近 **200** 行；每个 body 最多保存 **256 KiB**（超出截断并标注）。
-  **重启后自动加载历史**；超过 200 行时删除最旧的行，`auto_vacuum` 会回收空间。
-- 数据库按 `0600` 创建（Windows 忽略权限位），但临时目录里的内容仍可能含 API Key。
+  - 纯 MoonBit + `moonbitlang/async/fs` 异步线程池写盘，**零 C 第三方存储依赖**，不阻塞代理事件循环。
+- 最多保留最近 **200** 条；每个 body 最多保存 **256 KiB**（超出截断并标注）。
+  **重启后自动扫描恢复**（异常中断的半截尾记录安全忽略）；写满段容量后零拷贝截断轮转，写放大严格为 1×。
+- 日志文件按 `0600` 创建（Windows 忽略权限位），但临时目录里的内容仍可能含 API Key。
   清理交给系统临时目录策略（Windows 的 `%TEMP%` 不保证自动清理），也可随时手动删除或点「清空」。
-- `--no-web`（或 `--web off`）不启用监控页面，也不落盘，只在内存里保留最近 200 条。
+- `--no-web`（或 `--web off`）关闭监控页面并停用记录（零磁盘 I/O、零 body 捕获开销）。
 
 JSON API（页面即基于此实现，可自行脚本化）：
 
@@ -269,35 +268,30 @@ SSE 流式透传、chunked 请求体、GET/其他路径透传、`Authorization` 
 `.env` 加载与「命令行 > 环境变量 > .env」优先级、
 监控页面列表/详情/注入对比/SSE 出参捕获（浏览器实测）。
 
-## 性能（vs mitmproxy）
+## 性能（vs mitmproxy，明文 HTTP）
 
 基准脚本见 [test/bench/](test/bench/)（`upstream-fast.mjs` 极简 keep-alive 上游 +
-`loadgen.mjs` 固定并发压测器）。在 **2 核 Linux、loopback、小 JSON POST、客户端 keep-alive**
-下实测（mitmproxy 11.0.2，同机同上游，明文 HTTP 转发路径）：
+`loadgen.mjs` 固定并发压测器）。在 **Linux x86_64、loopback、明文 HTTP 转发路径** 下同机实测
+（`mitmdump 11.0.2 --mode regular -q` 纯转发 vs 本代理开启 `/v1/chat/completions` 拦截改写）：
 
-| 路径 | 并发 | RPS | p50 | p99 |
-|---|---|---|---|---|
-| 直连（无代理） | 32 | ~8990 | 3.1ms | 10.4ms |
-| **本代理（优化后）** | 32 | ~4140 | 5.6ms | 23.5ms |
-| **本代理（优化后）** | 64 | ~3930 | 15.3ms | 36.5ms |
-| mitmproxy 11.0.2 | 32 | ~560 | 55.2ms | 98.2ms |
+| HTTP 场景 | 直连基线 | `mitmdump 11.0.2` | **本代理（v0.10.0 `--web` 异步日志）** | **本代理（v0.10.0 `--no-web`）** | 相对 mitmproxy |
+|---|---:|---:|---:|---:|---|
+| 小 JSON（2×32 并发） | 7,453 RPS · p50 7.4ms | 217 RPS · p50 288ms · p99 570ms | **6,976 RPS** · p50 **7.3ms** · p99 **24.9ms** | **7,101 RPS** · p50 **7.5ms** · p99 **22.9ms** | **~32×** 吞吐，p50 低 **39×** |
+| 64 KiB 大 JSON（16 并发） | — | 217 RPS · p50 71.6ms · p99 162ms | **1,988 RPS** · p50 **6.0ms** · p99 **41.4ms** | **2,516 RPS** · p50 **5.3ms** · p99 **19.7ms** | **9.2×–11.6×** 吞吐 |
+| 64 KiB + 30 chunks SSE（16 并发） | — | 220 RPS · p50 69.6ms · p99 152ms | **1,690 RPS** · p50 **7.0ms** · p99 **42.7ms** | **2,296 RPS** · p50 **6.3ms** · p99 **16.2ms** | **7.7×–10.4×** 吞吐 |
 
-**结论：明文 HTTP 转发路径上，优化后吞吐约为 mitmproxy 的 7.4×，p50 延迟约低 10×、p99 约低 4×；
-达到直连吞吐的 ~46%（优化前仅 ~13%）。**
+**结论：明文 HTTP 转发路径上，v0.10.0 单核即达直连吞吐的 ~94%–95%，相对 mitmproxy 提升约 32×（大包 64 KiB JSON 与流式 SSE 提升约 8×–12×），p50 延迟低 10×–39×。**
 
-优化手段（v0.9.0）：
-1. **客户端 keep-alive 循环**：一条连接服务多个请求，省去每请求 accept/重连。
-2. **上游连接池 + keep-alive**：复用空闲上游连接（含 stale 连接一次性重试），省去每请求 TCP 握手。
-3. **正确 body 定界**（Content-Length / chunked / close-delimited）使连接可复用；SSE 仍逐块透传。
-4. **监控批量异步落盘**：热路径只进内存队列，后台每 ~20ms 单事务批写 SQLite，避免每请求 fsync/commit 阻塞事件循环。
-5. 去掉热路径每请求日志；容量淘汰同时计算内存+DB。
+优化手段（v0.9.0 → v0.10.0）：
+1. **双端 keep-alive + 上游连接池（128）+ 上游 IP/DNS TTL 缓存**，省去每请求握手与重复解析。
+2. **读写合并 + SSE 3× 降写**：请求/响应头与中小体合并为单次 `Tcp::write`，SSE 每个 chunk 合并为 1 次写并真流式逐块透传（~1ms 转发延迟），零拷贝复用 64 KiB 缓冲。
+3. **字节级 JSON 手术式前缀注入**：对 `/v1/chat/completions` 请求体直接按 UTF-8 字节扫描与 `blit` 拼接，避免大上下文整包 DOM 反序列化/重序列化（复杂多模态/非法 JSON 自动回退标准 `@json.parse`）。
+4. **异步双段顺序追加日志**：移除 SQLite，改用 `moonbitlang/async/fs` 线程池异步批写 `flows.{0,1}.log`，零事件循环阻塞、零拷贝轮转；`--no-web` 为零开销模式。
+5. **Linux 多 Worker 支持**：新增 `-j` / `--workers <N>`（基于 `SO_REUSEPORT` 负载均衡）。
 
 口径与限制（务必注意）：
-- **只比明文 HTTP 转发**。mitmproxy 默认对 HTTPS 做 MITM（TLS 终止+重签），本代理 HTTPS 走盲隧道
-  不做 MITM——那部分工作量不同，不能直接比。
-- 2 核机器上同时跑压测器+上游+代理三个进程存在 CPU 争抢；直连只有两个进程。本代理单线程事件循环
-  单核天花板约 4k rps，进一步提升需多 worker（async 运行时为单 loop）或更底层的解析复用。
-- 监控为 best-effort：崩溃可能丢失最近 ~20ms 未落盘的 flow（不影响代理正确性）。
+- **只比明文 HTTP 转发**。mitmproxy 默认对 HTTPS 做 MITM（TLS 终止+重签），本代理 HTTPS 走盲隧道不做 MITM——那部分工作量不同，不能直接比。
+- 监控为 best-effort：异常崩溃可能丢失最近 ~100ms 未落盘的 flow（不影响代理正确性）。
 
 复现：
 ```bash
