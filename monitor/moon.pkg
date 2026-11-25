@@ -9,8 +9,6 @@ import {
   "moonbitlang/core/string",
   "moonbitlang/core/env",
   "moonbitlang/core/encoding/utf8",
-  "moonbitstack/moonsqlite" @sqlite,
-  "moonbitstack/moondb",
 }
 
 supported_targets = "+native"

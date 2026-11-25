@@ -1,10 +1,16 @@
 ///|
-#cfg(platform="linux")
-let supports_reuse_port_workers : Bool = true
+#cfg(platform="windows")
+async fn supports_reuse_port_workers() -> Bool {
+  false
+}
 
 ///|
-#cfg(not(platform="linux"))
-let supports_reuse_port_workers : Bool = false
+#cfg(not(platform="windows"))
+async fn supports_reuse_port_workers() -> Bool {
+  @fs.exists("/proc/sys/kernel/ostype") catch {
+    _ => false
+  }
+}
 
 ///|
 /// Parse internal worker identity set by the supervisor when `--workers > 1`.
@@ -70,9 +76,10 @@ async fn main {
       @env.exit(1)
     }
   }
+  let can_reuse_port = supports_reuse_port_workers()
   let worker_id = worker_id_from_env()
   if cfg.workers > 1 && worker_id is None {
-    if supports_reuse_port_workers {
+    if can_reuse_port {
       run_supervisor(args, cfg.workers) catch {
         e => {
           println("[proxy] supervisor fatal: " + e.to_string())
@@ -91,10 +98,10 @@ async fn main {
     Some(id) => id == 0
     None => true
   }
-  let reuse_port = is_worker_child && supports_reuse_port_workers
+  let reuse_port = is_worker_child && can_reuse_port
   let host_web = cfg.web_enabled && is_primary
   // Monitor flows live in the system temp directory so they survive proxy
-  // restarts; `--no-web` uses a zero-overhead disabled store (no SQLite, no
+  // restarts; `--no-web` uses a zero-overhead disabled store (no disk log, no
   // body capture).
   let store = if cfg.web_enabled {
     let dir = @proxy.default_store_dir(port=cfg.web_port)

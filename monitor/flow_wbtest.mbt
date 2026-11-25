@@ -12,7 +12,7 @@ fn begin_test_flow(store : FlowStore, target : String) -> Flow {
 }
 
 ///|
-test "flow: begin / finish / find / clear" {
+async test "flow: begin / finish / find / clear" {
   let store = FlowStore::new(capacity=2)
   let f1 = begin_test_flow(store, "/a")
   assert_eq(f1.id, 1)
@@ -64,7 +64,7 @@ test "flow: decode_chunked_body" {
 }
 
 ///|
-test "flow: list and detail via shared contract" {
+async test "flow: list and detail via shared contract" {
   let store = FlowStore::new()
   let f = begin_test_flow(store, "/v1/chat/completions")
   f.injected = true
@@ -101,7 +101,7 @@ test "flow: list and detail via shared contract" {
 }
 
 ///|
-test "flow: pending flow has null response in detail" {
+async test "flow: pending flow has null response in detail" {
   let store = FlowStore::new()
   let f = begin_test_flow(store, "/x")
   let d = store.detail(f.id).unwrap()
@@ -111,12 +111,13 @@ test "flow: pending flow has null response in detail" {
 }
 
 ///|
-async test "flow: sqlite persists to temp dir, reloads, evicts, marks stale and clears" {
+async test "flow: append-log persists to temp dir, reloads, rotates, recovers truncated tail and clears" {
   let dir = @fs.tmpdir(prefix="vscode-chat-proxy-test")
   let store = FlowStore::open(dir, capacity=2)
   assert_eq(store.data_dir(), dir)
-  let db_path = dir + "/monitor.sqlite"
-  assert_true(@fs.exists(db_path))
+  let seg0 = dir + "/flows.0.log"
+  let seg1 = dir + "/flows.1.log"
+  assert_true(@fs.exists(seg0))
   let f1 = begin_test_flow(store, "/one")
   f1.status = 200
   f1.reason = "OK"
@@ -125,36 +126,62 @@ async test "flow: sqlite persists to temp dir, reloads, evicts, marks stale and 
   f1.response_size = 8
   store.finish(f1)
   store.flush_pending()
-  assert_true(@fs.exists(db_path))
-  // Bodies are released from memory, but the detail API reads them back.
+  assert_true(@fs.exists(seg0))
+  // Bodies are released from memory, but the detail API reads them back via pread.
   assert_eq(f1.response_body.length(), 0)
   let d1 = store.detail(f1.id).unwrap()
   assert_eq(d1.response.unwrap().body, "{\"ok\":1}")
   store.close()
 
-  // Simulate a proxy restart: a new store loads the same database.
+  // Simulate a proxy restart: a new store reloads from the segment log.
   let store2 = FlowStore::open(dir, capacity=2)
   assert_eq(store2.list_response().stored, 1)
   assert_eq(store2.list_response().flows[0].path, "/one")
   let d2 = store2.detail(f1.id).unwrap()
   assert_eq(d2.response.unwrap().body, "{\"ok\":1}")
 
-  // Capacity 2: a third finished flow evicts the oldest row.
-  let f2 = begin_test_flow(store2, "/two")
-  store2.finish(f2)
-  let f3 = begin_test_flow(store2, "/three")
-  store2.finish(f3)
-  store2.flush_pending()
+  // Capacity 2: finish 5 more flows one by one across flushes to exercise
+  // 2-segment rotation (seg0 -> seg1 -> seg0) without copying live records.
+  for i = 2; i <= 6; i = i + 1 {
+    let f = begin_test_flow(store2, "/p" + i.to_string())
+    f.status = 200
+    f.reason = "OK"
+    f.response_body = @utf8.encode("body-" + i.to_string())
+    f.response_size = 6
+    store2.finish(f)
+    store2.flush_pending()
+  }
+  assert_true(@fs.exists(seg1))
   assert_eq(store2.list_response().stored, 2)
-  assert_true(store2.find(f1.id) is None)
-  assert_true(store2.find(f2.id) is Some(_))
+  assert_eq(store2.list_response().total, 6)
+  assert_true(store2.find(1) is None)
+  assert_true(store2.find(4) is None)
+  assert_eq(store2.detail(5).unwrap().response.unwrap().body, "body-5")
+  assert_eq(store2.detail(6).unwrap().response.unwrap().body, "body-6")
 
   // In-flight (begun, unfinished) flows are memory-only under batched
-  // persistence: a crashed process leaves no row for them (best-effort monitor).
+  // persistence: a crashed process leaves no record for them.
   let inflight = begin_test_flow(store2, "/inflight")
   store2.close()
+
+  // Append a corrupted/truncated tail to both segments to simulate a crash
+  // mid-write; recovery must keep all intact records cleanly.
+  for p in [seg0, seg1] {
+    if @fs.exists(p) {
+      @fs.write_file(
+        p,
+        b"FLW1\xff\x00\x00\x00partial",
+        create_mode=OpenExisting,
+        append=true,
+      )
+    }
+  }
   let store3 = FlowStore::open(dir, capacity=2)
   assert_true(store3.find(inflight.id) is None)
+  assert_eq(store3.list_response().stored, 2)
+  assert_eq(store3.list_response().total, 6)
+  assert_eq(store3.detail(5).unwrap().response.unwrap().body, "body-5")
+  assert_eq(store3.detail(6).unwrap().response.unwrap().body, "body-6")
 
   store3.clear()
   assert_eq(store3.list_response().stored, 0)
@@ -164,7 +191,7 @@ async test "flow: sqlite persists to temp dir, reloads, evicts, marks stale and 
 }
 
 ///|
-test "monitor: intercept switch defaults on and toggles at runtime" {
+async test "monitor: intercept switch defaults on and toggles at runtime" {
   let store = FlowStore::new()
   assert_true(store.intercept_enabled())
   assert_true(store.list_response().intercept_enabled)
@@ -177,7 +204,7 @@ test "monitor: intercept switch defaults on and toggles at runtime" {
 }
 
 ///|
-test "flow: disabled store skips recording while preserving intercept switch" {
+async test "flow: disabled store skips recording while preserving intercept switch" {
   let store = FlowStore::disabled()
   assert_true(!store.is_recording())
   assert_true(store.intercept_enabled())
@@ -191,7 +218,7 @@ test "flow: disabled store skips recording while preserving intercept switch" {
 }
 
 ///|
-test "flow: burst flush pre-drops oldest excess beyond capacity" {
+async test "flow: burst flush pre-drops oldest excess beyond capacity" {
   let store = FlowStore::new(capacity=3)
   for i = 0; i < 8; i = i + 1 {
     let f = begin_test_flow(store, "/p" + i.to_string())

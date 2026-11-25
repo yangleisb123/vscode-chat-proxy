@@ -3,7 +3,6 @@ package "1123Javayanglei/vscode-chat-proxy/monitor"
 
 import {
   "1123Javayanglei/vscode-chat-proxy/shared",
-  "moonbitstack/moonsqlite",
 }
 
 // Values
@@ -50,7 +49,6 @@ pub fn Flow::detail(Self) -> @shared.FlowDetail
 pub fn Flow::summary(Self) -> @shared.FlowSummary
 
 pub struct FlowStore {
-  db : @moonsqlite.SqliteDriver
   dir : String
   capacity : Int32
   mut active : Array[Flow]
@@ -62,17 +60,17 @@ pub struct FlowStore {
   // private fields
 }
 pub fn FlowStore::begin(Self, client_addr~ : String, http_method~ : String, target~ : String, request_headers~ : Array[(String, String)], request_body~ : Bytes, intercepted~ : Bool, upstream~ : String) -> Flow
-pub fn FlowStore::clear(Self) -> Unit
-pub fn FlowStore::close(Self) -> Unit
+pub async fn FlowStore::clear(Self) -> Unit
+pub async fn FlowStore::close(Self) -> Unit
 pub fn FlowStore::data_dir(Self) -> String
-pub fn FlowStore::detail(Self, Int32) -> @shared.FlowDetail?
+pub async fn FlowStore::detail(Self, Int32) -> @shared.FlowDetail?
 pub fn FlowStore::disabled() -> Self
-pub fn FlowStore::find(Self, Int32) -> Flow?
+pub async fn FlowStore::find(Self, Int32) -> Flow?
 pub fn FlowStore::finish(Self, Flow) -> Unit
-pub fn FlowStore::flush_pending(Self) -> Unit
+pub async fn FlowStore::flush_pending(Self) -> Unit
 pub fn FlowStore::intercept_enabled(Self) -> Bool
 pub fn FlowStore::is_recording(Self) -> Bool
-pub fn FlowStore::list_response(Self) -> @shared.FlowsResponse
+pub async fn FlowStore::list_response(Self) -> @shared.FlowsResponse
 pub fn FlowStore::new(capacity? : Int32) -> Self
 pub async fn FlowStore::open(String, capacity? : Int32, worker_id? : Int32, workers? : Int32) -> Self
 pub async fn FlowStore::run_flusher(Self) -> Unit

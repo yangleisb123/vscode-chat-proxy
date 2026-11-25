@@ -7,14 +7,22 @@ let empty_bytes : Bytes = b""
 pub let body_capture_limit : Int32 = 256 * 1024
 
 ///|
-/// Default number of flows kept in the SQLite store.
+/// Default number of flows kept in the monitor store.
 let default_flow_capacity : Int32 = 200
 
 ///|
-/// Background flusher interval in milliseconds. In-memory active/pending flows
-/// are served directly by `list_response`/`detail`, so 50ms keeps UI latency
-/// invisible while amortizing WAL writes and capping burst disk churn.
-let flush_interval_ms : Int32 = 50
+/// Background flusher interval in milliseconds. Active and pending flows are
+/// served directly from memory, so 100ms keeps UI latency invisible while
+/// amortizing disk appends and capping burst I/O to at most `capacity` flows.
+let flush_interval_ms : Int32 = 100
+
+///|
+/// 16-byte segment file header: `VCP1` (4B) + version=1 (4B LE) + gen (8B LE).
+let seg_header_size : Int64 = 16L
+
+///|
+/// 8-byte record frame header: `FLW1` (4B) + payload_len (4B LE).
+let rec_header_size : Int32 = 8
 
 ///|
 /// One proxied request/response pair, as shown in the monitor UI.
@@ -42,24 +50,72 @@ pub(all) struct Flow {
   mut end_ms : UInt64
   mut error : String?
   mut finished : Bool
-  /// Whether the full flow has been written to the SQLite database. Finished
-  /// flows release their captured bodies from memory; details are read back
-  /// from the database on demand.
+  /// Whether the full flow has been persisted to the append-only log. Finished
+  /// flows release their captured bodies from memory; details are read back on
+  /// demand via async `pread` (`File::read_exactly_at`).
   mut persisted : Bool
 }
 
 ///|
-/// SQLite-backed flow store. One `monitor.sqlite` file lives in the system
-/// temp directory (see `default_store_dir`); `FlowStore::new` opens an
-/// in-memory database for tests; `FlowStore::disabled` disables recording for
-/// `--no-web` zero-overhead proxy runs.
+/// In-memory index entry for one persisted flow. Keeps only the lightweight
+/// summary plus the exact `(segment, offset, length)` location on disk (or
+/// `mem_payload` in in-memory mode).
+priv struct PersistedEntry {
+  id : Int32
+  seg : Int32
+  payload_offset : Int64
+  payload_len : Int32
+  summary : @shared.FlowSummary
+  mem_payload : Bytes?
+}
+
+///|
+/// Decoded metadata header of a persisted flow record (everything before the
+/// three raw body blobs).
+priv struct DecodedMeta {
+  id : Int32
+  start_ms : UInt64
+  end_ms : UInt64
+  status : Int32
+  request_size : Int32
+  response_size : Int32
+  total_snapshot : Int32
+  injected_snapshot : Int32
+  request_truncated : Bool
+  intercepted : Bool
+  injected : Bool
+  upstream_truncated : Bool
+  response_truncated : Bool
+  finished : Bool
+  has_upstream_body : Bool
+  client_addr : String
+  http_method : String
+  target : String
+  upstream : String
+  reason : String
+  content_type : String
+  error : String?
+  request_headers : Array[(String, String)]
+  response_headers : Array[(String, String)]
+}
+
+///|
+/// Async sequential append-only file store for captured flows.
 ///
-/// The store is bounded: at most `capacity` rows are kept (`DELETE` oldest in
-/// the same transaction + periodic `incremental_vacuum`). Only in-flight and
-/// un-flushed flows keep bodies in memory; persisted summaries are cached in
-/// memory so `GET /api/flows` never hits SQLite.
+/// Uses two rotating segment files (`flows.0.log` and `flows.1.log`) inside the
+/// monitor directory so:
+/// - Writes are batched into ONE sequential `@fs.File::write_at` call that runs
+///   off the event loop in `moonbitlang/async`'s C worker thread pool (zero
+///   event-loop stalls even on 64–256 KiB LLM request/response bodies).
+/// - Disk usage is strictly bounded without compaction copies: once the active
+///   segment holds `>= capacity` records and the inactive segment has no live
+///   entries, the inactive segment is truncated and becomes active (1.0x write
+///   amplification).
+/// - `GET /api/flows` is served purely from memory; `GET /api/flows/:id` reads
+///   only the requested record via a single async `File::read_exactly_at`.
+/// - `FlowStore::new` keeps records in memory for unit tests;
+///   `FlowStore::disabled` disables recording for `--no-web` zero-overhead runs.
 pub struct FlowStore {
-  db : @sqlite.SqliteDriver
   dir : String
   capacity : Int32
   mut active : Array[Flow]
@@ -69,70 +125,27 @@ pub struct FlowStore {
   mut injected_total : Int32
   mut intercept_enabled : Bool
   priv recording : Bool
+  priv worker_id : Int32
+  priv workers : Int32
   priv id_stride : Int32
-  priv mut pending_total_delta : Int32
-  priv mut pending_injected_delta : Int32
-  priv mut db_count : Int32
-  priv mut flush_ticks : Int32
-  priv mut summary_cache : Array[@shared.FlowSummary]
-  priv mut insert_stmt : &@moondb.Stmt?
-  priv mut update_stat_stmt : &@moondb.Stmt?
-  priv mut add_stat_stmt : &@moondb.Stmt?
-  priv mut evict_stmt : &@moondb.Stmt?
-  priv mut find_stmt : &@moondb.Stmt?
-  priv mut detail_stmt : &@moondb.Stmt?
+  priv seg_files : FixedArray[@fs.File?]
+  priv mut seg_offsets : FixedArray[Int64]
+  priv mut seg_counts : FixedArray[Int32]
+  priv mut active_seg : Int32
+  priv mut gen : UInt64
+  priv mut persisted : Array[PersistedEntry]
+  priv mut flushing : Array[Flow]
+  priv mut clear_epoch : Int32
+  priv flush_sem : @async.Semaphore
 }
-
-///|
-/// Schema + SQLite tuning. Monitor history is best-effort temp data (losing it
-/// on power loss never affects proxy correctness), so WAL + `synchronous=OFF` +
-/// `auto_vacuum=INCREMENTAL` avoids per-flush fsync and page-relocation stalls.
-/// `id INTEGER PRIMARY KEY` is already the ordered rowid B-tree, so no extra
-/// secondary index on `id` is needed.
-let schema_sql : String = "PRAGMA journal_mode=WAL;\n" +
-  "PRAGMA synchronous=OFF;\n" +
-  "PRAGMA temp_store=MEMORY;\n" +
-  "PRAGMA cache_size=-4000;\n" +
-  "PRAGMA auto_vacuum=INCREMENTAL;\n" +
-  "PRAGMA busy_timeout=3000;\n" +
-  "CREATE TABLE IF NOT EXISTS flows (\n" +
-  "  id INTEGER PRIMARY KEY,\n" +
-  "  start_ms INTEGER NOT NULL,\n" +
-  "  client_addr TEXT NOT NULL,\n" +
-  "  method TEXT NOT NULL,\n" +
-  "  target TEXT NOT NULL,\n" +
-  "  request_headers TEXT NOT NULL,\n" +
-  "  request_body BLOB NOT NULL,\n" +
-  "  request_size INTEGER NOT NULL,\n" +
-  "  request_truncated INTEGER NOT NULL,\n" +
-  "  intercepted INTEGER NOT NULL,\n" +
-  "  upstream TEXT NOT NULL,\n" +
-  "  injected INTEGER NOT NULL,\n" +
-  "  upstream_body BLOB,\n" +
-  "  upstream_truncated INTEGER NOT NULL,\n" +
-  "  status INTEGER NOT NULL,\n" +
-  "  reason TEXT NOT NULL,\n" +
-  "  response_headers TEXT NOT NULL,\n" +
-  "  response_body BLOB NOT NULL,\n" +
-  "  response_size INTEGER NOT NULL,\n" +
-  "  response_truncated INTEGER NOT NULL,\n" +
-  "  end_ms INTEGER NOT NULL,\n" +
-  "  error TEXT,\n" +
-  "  finished INTEGER NOT NULL,\n" +
-  "  content_type TEXT NOT NULL\n" +
-  ");\n" +
-  "DROP INDEX IF EXISTS idx_flows_id;\n" +
-  "CREATE TABLE IF NOT EXISTS stats (key TEXT PRIMARY KEY, value INTEGER NOT NULL);\n" +
-  "INSERT OR IGNORE INTO stats (key, value) VALUES ('total', 0);\n" +
-  "INSERT OR IGNORE INTO stats (key, value) VALUES ('injected_total', 0);\n"
 
 ///|
 /// Default on-disk location for monitor data: a stable subdirectory of the
 /// system temp directory, one per monitor port so separate proxy instances do
-/// not overwrite each other's database.
+/// not overwrite each other's logs.
 ///
 /// `MONITOR_DIR` / `VSCODE_CHAT_PROXY_MONITOR_DIR` override the location.
-/// The OS may clean the temp directory at any time; losing this file only
+/// The OS may clean the temp directory at any time; losing these files only
 /// loses monitor history, never proxy correctness.
 pub fn default_store_dir(port~ : Int32) -> String {
   for name in ["VSCODE_CHAT_PROXY_MONITOR_DIR", "MONITOR_DIR"] {
@@ -196,11 +209,9 @@ pub fn FlowStore::is_recording(self : FlowStore) -> Bool {
 
 ///|
 /// No-op flow store for `--no-web` mode: keeps the live `intercept_enabled`
-/// flag without touching SQLite or buffering request/response bodies.
+/// flag without writing files or buffering request/response bodies.
 pub fn FlowStore::disabled() -> FlowStore {
-  let db = @sqlite.SqliteDriver::open(":memory:") catch { _ => panic() }
   {
-    db,
     dir: "",
     capacity: 0,
     active: [],
@@ -210,42 +221,28 @@ pub fn FlowStore::disabled() -> FlowStore {
     injected_total: 0,
     intercept_enabled: true,
     recording: false,
+    worker_id: 0,
+    workers: 1,
     id_stride: 1,
-    pending_total_delta: 0,
-    pending_injected_delta: 0,
-    db_count: 0,
-    flush_ticks: 0,
-    summary_cache: [],
-    insert_stmt: None,
-    update_stat_stmt: None,
-    add_stat_stmt: None,
-    evict_stmt: None,
-    find_stmt: None,
-    detail_stmt: None,
+    seg_files: [None, None],
+    seg_offsets: [0L, 0L],
+    seg_counts: [0, 0],
+    active_seg: 0,
+    gen: 0UL,
+    persisted: [],
+    flushing: [],
+    clear_epoch: 0,
+    flush_sem: @async.Semaphore(1),
   }
 }
 
 ///|
-/// Open a SQLite database at `path` (or `:memory:`) and prepare the schema.
-/// Returns `None` when the database cannot be opened/initialised, so callers
-/// can fall back to an in-memory store instead of taking the proxy down.
-fn open_store(
-  path : String,
-  dir : String,
-  capacity : Int32,
-  worker_id : Int32,
-  workers : Int32,
-) -> FlowStore? {
-  let db = @sqlite.SqliteDriver::open(path) catch {
-    e => {
-      println("[monitor] cannot open " + path + ": " + e.to_string())
-      return None
-    }
-  }
-  let stride = if workers > 1 { workers } else { 1 }
-  let store : FlowStore = {
-    db,
-    dir,
+/// In-memory store (tests, and the fallback when the temp directory is not
+/// writable). Uses the exact same binary record codec and eviction rules as
+/// the file-backed store.
+pub fn FlowStore::new(capacity~ : Int32 = default_flow_capacity) -> FlowStore {
+  {
+    dir: "",
     capacity,
     active: [],
     pending: [],
@@ -254,218 +251,610 @@ fn open_store(
     injected_total: 0,
     intercept_enabled: true,
     recording: true,
-    id_stride: stride,
-    pending_total_delta: 0,
-    pending_injected_delta: 0,
-    db_count: 0,
-    flush_ticks: 0,
-    summary_cache: [],
-    insert_stmt: None,
-    update_stat_stmt: None,
-    add_stat_stmt: None,
-    evict_stmt: None,
-    find_stmt: None,
-    detail_stmt: None,
+    worker_id: 0,
+    workers: 1,
+    id_stride: 1,
+    seg_files: [None, None],
+    seg_offsets: [0L, 0L],
+    seg_counts: [0, 0],
+    active_seg: 0,
+    gen: 0UL,
+    persisted: [],
+    flushing: [],
+    clear_epoch: 0,
+    flush_sem: @async.Semaphore(1),
   }
-  if !store.init_schema() {
-    store.db.close()
+}
+
+///|
+fn segment_path_for(
+  dir : String,
+  worker_id : Int32,
+  workers : Int32,
+  seg : Int32,
+) -> String {
+  let sep = if dir.contains("\\") { "\\" } else { "/" }
+  if workers > 1 {
+    dir +
+    sep +
+    "flows-w" +
+    worker_id.to_string() +
+    "." +
+    seg.to_string() +
+    ".log"
+  } else {
+    dir + sep + "flows." + seg.to_string() + ".log"
+  }
+}
+
+///|
+fn FlowStore::seg_path(self : FlowStore, seg : Int32) -> String {
+  segment_path_for(self.dir, self.worker_id, self.workers, seg)
+}
+
+///|
+fn make_segment_header(gen : UInt64) -> Bytes {
+  let buf = @buffer.Buffer(capacity=16)
+  buf.write_bytes(b"VCP1")
+  buf.write_int_le(1)
+  buf.write_uint64_le(gen)
+  buf.to_bytes()
+}
+
+///|
+fn read_u32_le(b : Bytes, pos : Int32) -> Int32 {
+  let b0 = b[pos].to_int()
+  let b1 = b[pos + 1].to_int()
+  let b2 = b[pos + 2].to_int()
+  let b3 = b[pos + 3].to_int()
+  b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+}
+
+///|
+fn read_u64_le(b : Bytes, pos : Int32) -> UInt64 {
+  let lo = read_u32_le(b, pos).reinterpret_as_uint().to_uint64()
+  let hi = read_u32_le(b, pos + 4).reinterpret_as_uint().to_uint64()
+  lo | (hi << 32)
+}
+
+///|
+fn check_magic(b : Bytes, pos : Int32, m : Bytes) -> Bool {
+  pos + 4 <= b.length() &&
+  b[pos] == m[0] &&
+  b[pos + 1] == m[1] &&
+  b[pos + 2] == m[2] &&
+  b[pos + 3] == m[3]
+}
+
+///|
+fn write_lp_string(buf : @buffer.Buffer, s : String) -> Unit {
+  let utf8 = @utf8.encode(s)
+  buf.write_int_le(utf8.length())
+  if utf8.length() > 0 {
+    buf.write_bytes(utf8[:])
+  }
+}
+
+///|
+fn write_lp_bytes(buf : @buffer.Buffer, data : Bytes) -> Unit {
+  buf.write_int_le(data.length())
+  if data.length() > 0 {
+    buf.write_bytes(data[:])
+  }
+}
+
+///|
+fn write_headers_bin(
+  buf : @buffer.Buffer,
+  headers : Array[(String, String)],
+) -> Unit {
+  buf.write_int_le(headers.length())
+  for pair in headers {
+    write_lp_string(buf, pair.0)
+    write_lp_string(buf, pair.1)
+  }
+}
+
+///|
+/// Encode one flow's metadata section (everything before the 3 raw body blobs).
+fn encode_flow_meta(
+  flow : Flow,
+  total_snap : Int32,
+  injected_snap : Int32,
+) -> Bytes {
+  let meta = @buffer.Buffer(capacity=512)
+  meta.write_int_le(flow.id)
+  meta.write_uint64_le(flow.start_ms)
+  meta.write_uint64_le(flow.end_ms)
+  meta.write_int_le(flow.status)
+  meta.write_int_le(flow.request_size)
+  meta.write_int_le(flow.response_size)
+  meta.write_int_le(total_snap)
+  meta.write_int_le(injected_snap)
+  let mut flags = 0
+  if flow.request_truncated {
+    flags = flags | 1
+  }
+  if flow.intercepted {
+    flags = flags | 2
+  }
+  if flow.injected {
+    flags = flags | 4
+  }
+  if flow.upstream_truncated {
+    flags = flags | 8
+  }
+  if flow.response_truncated {
+    flags = flags | 16
+  }
+  if flow.finished {
+    flags = flags | 32
+  }
+  if flow.upstream_body is Some(_) {
+    flags = flags | 64
+  }
+  if flow.error is Some(_) {
+    flags = flags | 128
+  }
+  meta.write_int_le(flags)
+  write_lp_string(meta, flow.client_addr)
+  write_lp_string(meta, flow.http_method)
+  write_lp_string(meta, flow.target)
+  write_lp_string(meta, flow.upstream)
+  write_lp_string(meta, flow.reason)
+  write_lp_string(meta, content_type(flow.response_headers))
+  match flow.error {
+    Some(e) => write_lp_string(meta, e)
+    None => meta.write_int_le(0)
+  }
+  write_headers_bin(meta, flow.request_headers)
+  write_headers_bin(meta, flow.response_headers)
+  meta.to_bytes()
+}
+
+///|
+/// Write one complete framed record (`FLW1` + `payload_len` + payload) directly
+/// into `out`, avoiding any intermediate copy of large request/response bodies.
+/// Returns `payload_len`.
+fn write_flow_frame_to(
+  out : @buffer.Buffer,
+  flow : Flow,
+  total_snap : Int32,
+  injected_snap : Int32,
+) -> Int32 {
+  let meta_bytes = encode_flow_meta(flow, total_snap, injected_snap)
+  let up_len = match flow.upstream_body {
+    Some(b) => b.length()
+    None => 0
+  }
+  let payload_len = 4 +
+    meta_bytes.length() +
+    4 +
+    flow.request_body.length() +
+    4 +
+    up_len +
+    4 +
+    flow.response_body.length()
+  out.write_bytes(b"FLW1")
+  out.write_int_le(payload_len)
+  out.write_int_le(meta_bytes.length())
+  out.write_bytes(meta_bytes[:])
+  write_lp_bytes(out, flow.request_body)
+  match flow.upstream_body {
+    Some(b) => write_lp_bytes(out, b)
+    None => out.write_int_le(0)
+  }
+  write_lp_bytes(out, flow.response_body)
+  payload_len
+}
+
+///|
+/// Encode one flow into its standalone binary record payload (in-memory mode).
+fn encode_flow_payload(
+  flow : Flow,
+  total_snap : Int32,
+  injected_snap : Int32,
+) -> Bytes {
+  let meta_bytes = encode_flow_meta(flow, total_snap, injected_snap)
+  let up_len = match flow.upstream_body {
+    Some(b) => b.length()
+    None => 0
+  }
+  let total_payload_len = 4 +
+    meta_bytes.length() +
+    4 +
+    flow.request_body.length() +
+    4 +
+    up_len +
+    4 +
+    flow.response_body.length()
+  let out = @buffer.Buffer(capacity=total_payload_len)
+  out.write_int_le(meta_bytes.length())
+  out.write_bytes(meta_bytes[:])
+  write_lp_bytes(out, flow.request_body)
+  match flow.upstream_body {
+    Some(b) => write_lp_bytes(out, b)
+    None => out.write_int_le(0)
+  }
+  write_lp_bytes(out, flow.response_body)
+  out.to_bytes()
+}
+
+///|
+fn read_lp_string(b : Bytes, pos : Int32, end : Int32) -> (String, Int32)? {
+  if pos + 4 > end {
     return None
   }
-  store.prepare_statements()
-  store.load_meta()
-  if stride > 1 {
-    // Disjoint ID lanes across worker processes: worker k gets ids congruent
-    // to (k + 1) mod stride so concurrent WAL writers never collide on PK.
-    let offset = if worker_id >= 0 { worker_id % stride } else { 0 }
-    let base = store.next_id
-    let rem = (base - 1) % stride
-    let adjust = (offset - rem + stride) % stride
-    store.next_id = base + adjust
+  let len = read_u32_le(b, pos)
+  let start = pos + 4
+  if len < 0 || start + len > end {
+    return None
   }
-  if worker_id == 0 {
-    store.mark_stale_pending()
-    store.evict()
-  }
-  store.load_summary_cache()
-  Some(store)
+  let s = if len == 0 { "" } else { @utf8.decode_lossy(b[start:start + len]) }
+  Some((s, start + len))
 }
 
 ///|
-fn FlowStore::prepare_statements(self : FlowStore) -> Unit {
-  self.insert_stmt = Some(self.db.prepare(insert_flow_sql)) catch { _ => None }
-  self.update_stat_stmt = Some(
-    self.db.prepare("UPDATE stats SET value = ? WHERE key = ?"),
-  ) catch {
-    _ => None
+fn read_lp_bytes(b : Bytes, pos : Int32, end : Int32) -> (Bytes, Int32)? {
+  if pos + 4 > end {
+    return None
   }
-  self.add_stat_stmt = Some(
-    self.db.prepare("UPDATE stats SET value = value + ? WHERE key = ?"),
-  ) catch {
-    _ => None
+  let len = read_u32_le(b, pos)
+  let start = pos + 4
+  if len < 0 || start + len > end {
+    return None
   }
-  self.evict_stmt = Some(
-    self.db.prepare(
-      "DELETE FROM flows WHERE id IN (SELECT id FROM flows ORDER BY id ASC LIMIT ?)",
-    ),
-  ) catch {
-    _ => None
-  }
-  self.find_stmt = Some(self.db.prepare(find_flow_sql)) catch { _ => None }
-  self.detail_stmt = Some(self.db.prepare(detail_flow_sql)) catch { _ => None }
-}
-
-///|
-fn FlowStore::close_statements(self : FlowStore) -> Unit {
-  for
-    s in [
-      self.insert_stmt,
-      self.update_stat_stmt,
-      self.add_stat_stmt,
-      self.evict_stmt,
-      self.find_stmt,
-      self.detail_stmt,
-    ] {
-    match s {
-      Some(stmt) => stmt.close()
-      None => ()
-    }
-  }
-  self.insert_stmt = None
-  self.update_stat_stmt = None
-  self.add_stat_stmt = None
-  self.evict_stmt = None
-  self.find_stmt = None
-  self.detail_stmt = None
-}
-
-///|
-fn FlowStore::init_schema(self : FlowStore) -> Bool {
-  try {
-    self.db.exec_script(schema_sql)
-    true
-  } catch {
-    e => {
-      println("[monitor] cannot initialise SQLite schema: " + e.to_string())
-      false
-    }
-  }
-}
-
-///|
-/// Counters survive restarts; `next_id` continues after the largest stored id.
-fn FlowStore::load_meta(self : FlowStore) -> Unit {
-  self.total = self.read_stat("total")
-  self.injected_total = self.read_stat("injected_total")
-  let rows = self.rows("SELECT COALESCE(MAX(id), 0) + 1, COUNT(*) FROM flows", [])
-  if rows.length() > 0 {
-    self.next_id = row_int(rows[0], 0)
-    self.db_count = row_int(rows[0], 1)
+  let data = if len == 0 {
+    empty_bytes
   } else {
-    self.next_id = 1
-    self.db_count = 0
+    b[start:start + len].to_owned()
+  }
+  Some((data, start + len))
+}
+
+///|
+fn read_headers_bin(
+  b : Bytes,
+  pos : Int32,
+  end : Int32,
+) -> (Array[(String, String)], Int32)? {
+  if pos + 4 > end {
+    return None
+  }
+  let count = read_u32_le(b, pos)
+  if count < 0 || count > 4096 {
+    return None
+  }
+  let out : Array[(String, String)] = Array(capacity=count)
+  let mut p = pos + 4
+  for i = 0; i < count; i = i + 1 {
+    let (k, p1) = match read_lp_string(b, p, end) {
+      Some(pair) => pair
+      None => return None
+    }
+    let (v, p2) = match read_lp_string(b, p1, end) {
+      Some(pair) => pair
+      None => return None
+    }
+    out.push((k, v))
+    p = p2
+  }
+  Some((out, p))
+}
+
+///|
+/// Decode the metadata section (`meta_bytes`) of a persisted flow record.
+fn decode_meta(b : Bytes, start : Int32, end : Int32) -> DecodedMeta? {
+  // Fixed header inside meta: 7*4 + 2*8 = 44 bytes (id, start_ms, end_ms,
+  // status, req_size, resp_size, total_snap, inj_snap, flags).
+  if start + 44 > end {
+    return None
+  }
+  let id = read_u32_le(b, start)
+  let start_ms = read_u64_le(b, start + 4)
+  let end_ms = read_u64_le(b, start + 12)
+  let status = read_u32_le(b, start + 20)
+  let request_size = read_u32_le(b, start + 24)
+  let response_size = read_u32_le(b, start + 28)
+  let total_snapshot = read_u32_le(b, start + 32)
+  let injected_snapshot = read_u32_le(b, start + 36)
+  let flags = read_u32_le(b, start + 40)
+  let mut p = start + 44
+  let (client_addr, p1) = match read_lp_string(b, p, end) {
+    Some(pair) => pair
+    None => return None
+  }
+  p = p1
+  let (http_method, p2) = match read_lp_string(b, p, end) {
+    Some(pair) => pair
+    None => return None
+  }
+  p = p2
+  let (target, p3) = match read_lp_string(b, p, end) {
+    Some(pair) => pair
+    None => return None
+  }
+  p = p3
+  let (upstream, p4) = match read_lp_string(b, p, end) {
+    Some(pair) => pair
+    None => return None
+  }
+  p = p4
+  let (reason, p5) = match read_lp_string(b, p, end) {
+    Some(pair) => pair
+    None => return None
+  }
+  p = p5
+  let (content_type, p6) = match read_lp_string(b, p, end) {
+    Some(pair) => pair
+    None => return None
+  }
+  p = p6
+  let (err_str, p7) = match read_lp_string(b, p, end) {
+    Some(pair) => pair
+    None => return None
+  }
+  p = p7
+  let (request_headers, p8) = match read_headers_bin(b, p, end) {
+    Some(pair) => pair
+    None => return None
+  }
+  p = p8
+  let (response_headers, _) = match read_headers_bin(b, p, end) {
+    Some(pair) => pair
+    None => return None
+  }
+  let has_error = (flags & 128) != 0
+  Some({
+    id,
+    start_ms,
+    end_ms,
+    status,
+    request_size,
+    response_size,
+    total_snapshot,
+    injected_snapshot,
+    request_truncated: (flags & 1) != 0,
+    intercepted: (flags & 2) != 0,
+    injected: (flags & 4) != 0,
+    upstream_truncated: (flags & 8) != 0,
+    response_truncated: (flags & 16) != 0,
+    finished: (flags & 32) != 0,
+    has_upstream_body: (flags & 64) != 0,
+    client_addr,
+    http_method,
+    target,
+    upstream,
+    reason,
+    content_type,
+    error: if has_error {
+      Some(err_str)
+    } else {
+      None
+    },
+    request_headers,
+    response_headers,
+  })
+}
+
+///|
+fn DecodedMeta::to_summary(self : DecodedMeta) -> @shared.FlowSummary {
+  {
+    id: self.id,
+    start_ms: self.start_ms.to_double(),
+    http_method: self.http_method,
+    path: self.target,
+    status: self.status,
+    reason: self.reason,
+    intercepted: self.intercepted,
+    injected: self.injected,
+    pending: !self.finished,
+    error: self.error,
+    req_size: self.request_size,
+    resp_size: self.response_size,
+    duration_ms: duration_between(self.start_ms, self.end_ms),
+    content_type: self.content_type,
   }
 }
 
 ///|
-/// Populate the in-memory summary cache from persisted rows at startup.
-fn FlowStore::load_summary_cache(self : FlowStore) -> Unit {
-  let limit_clause = if self.capacity > 0 {
-    " LIMIT " + self.capacity.to_string()
-  } else {
-    ""
+fn DecodedMeta::to_flow_without_bodies(self : DecodedMeta) -> Flow {
+  {
+    id: self.id,
+    start_ms: self.start_ms,
+    client_addr: self.client_addr,
+    http_method: self.http_method,
+    target: self.target,
+    request_headers: self.request_headers,
+    request_size: self.request_size,
+    intercepted: self.intercepted,
+    upstream: self.upstream,
+    request_body: empty_bytes,
+    request_truncated: self.request_truncated,
+    injected: self.injected,
+    upstream_body: None,
+    upstream_truncated: self.upstream_truncated,
+    status: self.status,
+    reason: self.reason,
+    response_headers: self.response_headers,
+    response_body: empty_bytes,
+    response_size: self.response_size,
+    response_truncated: self.response_truncated,
+    end_ms: self.end_ms,
+    error: self.error,
+    finished: self.finished,
+    persisted: self.finished,
   }
-  let rows = self.rows(
-    "SELECT id, start_ms, method, target, status, reason, intercepted, " +
-    "injected, finished, error, request_size, response_size, end_ms, " +
-    "content_type FROM flows ORDER BY id DESC" +
-    limit_clause,
-    [],
-  )
-  let out : Array[@shared.FlowSummary] = []
-  for row in rows {
-    let start_ms = row_int64(row, 1)
-    let end_ms = row_int64(row, 12)
-    let status = row_int(row, 4)
-    let error = if row_is_null(row, 9) { None } else { Some(row_text(row, 9)) }
-    out.push({
-      id: row_int(row, 0),
-      start_ms: start_ms.to_double(),
-      http_method: row_text(row, 2),
-      path: row_text(row, 3),
-      status,
-      reason: row_text(row, 5),
-      intercepted: row_int(row, 6) != 0,
-      injected: row_int(row, 7) != 0,
-      pending: row_int(row, 8) == 0,
-      error,
-      req_size: row_int(row, 10),
-      resp_size: row_int(row, 11),
-      duration_ms: duration_between(
-        start_ms.reinterpret_as_uint64(),
-        end_ms.reinterpret_as_uint64(),
-      ),
-      content_type: row_text(row, 13),
+}
+
+///|
+/// Decode a full flow record payload (meta + 3 raw body blobs) into `FlowDetail`.
+fn decode_flow_detail(payload : Bytes) -> @shared.FlowDetail? {
+  let plen = payload.length()
+  if plen < 4 {
+    return None
+  }
+  let meta_len = read_u32_le(payload, 0)
+  if meta_len < 0 || 4 + meta_len > plen {
+    return None
+  }
+  let meta = match decode_meta(payload, 4, 4 + meta_len) {
+    Some(m) => m
+    None => return None
+  }
+  let mut p = 4 + meta_len
+  let (req_body, p1) = match read_lp_bytes(payload, p, plen) {
+    Some(pair) => pair
+    None => return None
+  }
+  p = p1
+  let (up_body, p2) = match read_lp_bytes(payload, p, plen) {
+    Some(pair) => pair
+    None => return None
+  }
+  p = p2
+  let (resp_body, _) = match read_lp_bytes(payload, p, plen) {
+    Some(pair) => pair
+    None => return None
+  }
+  let request : @shared.RequestData = {
+    http_method: meta.http_method,
+    target: meta.target,
+    headers: meta.request_headers,
+    body: @utf8.decode_lossy(req_body),
+    truncated: meta.request_truncated,
+    size: meta.request_size,
+  }
+  let upstream_request : @shared.UpstreamRequest? = if meta.has_upstream_body {
+    Some({
+      body: @utf8.decode_lossy(up_body),
+      truncated: meta.upstream_truncated,
+    })
+  } else {
+    None
+  }
+  let response : @shared.ResponseData? = if meta.status == 0 &&
+    meta.error is None {
+    None
+  } else {
+    Some({
+      status: meta.status,
+      reason: meta.reason,
+      headers: meta.response_headers,
+      body: @utf8.decode_lossy(resp_body),
+      truncated: meta.response_truncated,
+      size: meta.response_size,
     })
   }
-  self.summary_cache = out
+  Some({
+    id: meta.id,
+    start_ms: meta.start_ms.to_double(),
+    duration_ms: duration_between(meta.start_ms, meta.end_ms),
+    client_addr: meta.client_addr,
+    upstream: meta.upstream,
+    intercepted: meta.intercepted,
+    injected: meta.injected,
+    pending: !meta.finished,
+    error: meta.error,
+    request,
+    upstream_request,
+    response,
+  })
 }
 
 ///|
-/// A previous process may have died between INSERT (begin) and UPDATE
-/// (finish). Do not show such rows as eternally "pending".
-fn FlowStore::mark_stale_pending(self : FlowStore) -> Unit {
-  self.exec(
-    "UPDATE flows SET finished = 1, " +
-    "error = COALESCE(error, 'proxy stopped before flow completed'), " +
-    "end_ms = start_ms WHERE finished = 0",
+/// Scan one segment file on disk, reading ONLY each record's metadata section
+/// and skipping over the raw body blobs. Stops cleanly on a partial/truncated
+/// trailing record so crashes never corrupt recovery.
+/// Returns `(gen, valid_end_offset, record_count, entries, last_total, last_injected)`.
+async fn scan_segment_file(
+  file : @fs.File,
+  seg : Int32,
+) -> (UInt64, Int64, Int32, Array[PersistedEntry], Int32, Int32)? {
+  let fsize = file.size() catch { _ => return None }
+  if fsize < seg_header_size {
+    return None
+  }
+  let hdr = file.read_exactly_at(16, position=0L) catch { _ => return None }
+  if !check_magic(hdr, 0, b"VCP1") || read_u32_le(hdr, 4) != 1 {
+    return None
+  }
+  let gen = read_u64_le(hdr, 8)
+  let entries : Array[PersistedEntry] = []
+  let mut pos : Int64 = seg_header_size
+  let mut count = 0
+  let mut max_total = 0
+  let mut max_inj = 0
+  while pos + 12L <= fsize {
+    let rec_hdr = file.read_exactly_at(12, position=pos) catch { _ => break }
+    if !check_magic(rec_hdr, 0, b"FLW1") {
+      break
+    }
+    let payload_len = read_u32_le(rec_hdr, 4)
+    let meta_len = read_u32_le(rec_hdr, 8)
+    if payload_len < 4 || meta_len < 0 || 4 + meta_len > payload_len {
+      break
+    }
+    let next_pos = pos + rec_header_size.to_int64() + payload_len.to_int64()
+    if next_pos > fsize {
+      // Truncated trailing record from an abrupt crash: ignore cleanly.
+      break
+    }
+    let meta_bytes = file.read_exactly_at(meta_len, position=pos + 12L) catch {
+      _ => break
+    }
+    match decode_meta(meta_bytes, 0, meta_len) {
+      Some(meta) => {
+        if meta.total_snapshot > max_total {
+          max_total = meta.total_snapshot
+        }
+        if meta.injected_snapshot > max_inj {
+          max_inj = meta.injected_snapshot
+        }
+        entries.push({
+          id: meta.id,
+          seg,
+          payload_offset: pos + rec_header_size.to_int64(),
+          payload_len,
+          summary: meta.to_summary(),
+          mem_payload: None,
+        })
+        count += 1
+        pos = next_pos
+      }
+      None => break
+    }
+  }
+  Some((gen, pos, count, entries, max_total, max_inj))
+}
+
+///|
+async fn open_or_create_segment(
+  path : String,
+  gen : UInt64,
+  truncate~ : Bool,
+) -> @fs.File {
+  let file = @fs.open(
+    path,
+    mode=ReadWrite,
+    create_mode=if truncate { CreateOrTruncate } else { OpenOrCreate },
+    permission=0o600,
+    sync=NoSync,
   )
-  |> ignore
-}
-
-///|
-fn FlowStore::read_stat(self : FlowStore, key : String) -> Int32 {
-  let rows = self.rows("SELECT value FROM stats WHERE key = ?", [
-    @moondb.Text(key),
-  ])
-  if rows.length() > 0 {
-    row_int(rows[0], 0)
-  } else {
-    0
+  @fs.chmod(path, 0o600) catch {
+    _ => ()
   }
-}
-
-///|
-/// Execute one statement, logging (but not raising) SQLite errors.
-fn FlowStore::exec(self : FlowStore, sql : String) -> Bool {
-  try {
-    self.db.execute(sql, []) |> ignore
-    true
-  } catch {
-    e => {
-      println("[monitor] sqlite exec failed: " + e.to_string())
-      false
-    }
+  if truncate {
+    let hdr = make_segment_header(gen)
+    file.write_at(hdr[:], position=0L)
   }
+  file
 }
 
 ///|
-fn FlowStore::rows(
-  self : FlowStore,
-  sql : String,
-  params : Array[@moondb.Value],
-) -> Array[@moondb.Row] {
-  self.db.query(sql, params) catch {
-    e => {
-      println("[monitor] sqlite query failed: " + e.to_string())
-      []
-    }
-  }
-}
-
-///|
-/// Open (or create) the monitor directory and its SQLite database. I/O
-/// failures degrade gracefully to an in-memory store so the proxy itself is
-/// never taken down by the monitor.
+/// Open (or create) the monitor directory and its rotating append-only segment
+/// files (`flows.0.log` / `flows.1.log`). I/O failures degrade gracefully to an
+/// in-memory store so the proxy itself is never taken down by the monitor.
 pub async fn FlowStore::open(
   dir : String,
   capacity~ : Int32 = default_flow_capacity,
@@ -476,47 +865,145 @@ pub async fn FlowStore::open(
     return FlowStore::new(capacity~)
   }
   @fs.mkdir(dir, permission=0o700, recursive=true, allow_exist=true) catch {
-    e =>
+    e => {
       println("[monitor] cannot create data dir " + dir + ": " + e.to_string())
+      return FlowStore::new(capacity~)
+    }
   }
-  let path = dir + "/monitor.sqlite"
-  match open_store(path, dir, capacity, worker_id, workers) {
-    Some(store) => {
-      // The database and its WAL/SHM companions all carry captured API keys.
-      for suffix in ["", "-wal", "-shm"] {
-        @fs.chmod(path + suffix, 0o600) catch {
-          _ => ()
-        }
+  let stride = if workers > 1 { workers } else { 1 }
+  let store : FlowStore = {
+    dir,
+    capacity,
+    active: [],
+    pending: [],
+    next_id: 1,
+    total: 0,
+    injected_total: 0,
+    intercept_enabled: true,
+    recording: true,
+    worker_id,
+    workers: stride,
+    id_stride: stride,
+    seg_files: [None, None],
+    seg_offsets: [seg_header_size, seg_header_size],
+    seg_counts: [0, 0],
+    active_seg: 0,
+    gen: 1UL,
+    persisted: [],
+    flushing: [],
+    clear_epoch: 0,
+    flush_sem: @async.Semaphore(1),
+  }
+  // Recover existing segments (if any), ordered by generation.
+  let scanned : Array[
+    (Int32, UInt64, Int64, Int32, Array[PersistedEntry], Int32, Int32),
+  ] = []
+  for seg = 0; seg < 2; seg = seg + 1 {
+    let path = store.seg_path(seg)
+    if @fs.exists(path) {
+      let opened : @fs.File? = Some(
+        @fs.open(path, mode=ReadWrite, create_mode=OpenExisting, sync=NoSync),
+      ) catch {
+        _ => None
       }
-      store
+      match opened {
+        Some(f) =>
+          match scan_segment_file(f, seg) {
+            Some((gen, end_off, cnt, entries, tot, inj)) => {
+              store.seg_files[seg] = Some(f)
+              store.seg_offsets[seg] = end_off
+              store.seg_counts[seg] = cnt
+              scanned.push((seg, gen, end_off, cnt, entries, tot, inj))
+            }
+            None => f.close()
+          }
+        None => ()
+      }
     }
-    None => {
-      println("[monitor] cannot use " + path + ", falling back to memory")
-      FlowStore::new(capacity~)
+  }
+  scanned.sort_by((a, b) => a.1.compare(b.1))
+  let mut max_id = 0
+  for item in scanned {
+    let (seg, gen, _end_off, _cnt, entries, tot, inj) = item
+    if gen >= store.gen {
+      store.gen = gen
+      store.active_seg = seg
+    }
+    if tot > store.total {
+      store.total = tot
+    }
+    if inj > store.injected_total {
+      store.injected_total = inj
+    }
+    for e in entries {
+      if e.id > max_id {
+        max_id = e.id
+      }
+      store.persisted.push(e)
+    }
+  }
+  store.persisted.sort_by((a, b) => b.id - a.id)
+  if store.capacity > 0 && store.persisted.length() > store.capacity {
+    store.persisted.truncate(store.capacity)
+  }
+  store.next_id = max_id + 1
+  if stride > 1 {
+    let offset = if worker_id >= 0 { worker_id % stride } else { 0 }
+    let base = store.next_id
+    let rem = (base - 1) % stride
+    let adjust = (offset - rem + stride) % stride
+    store.next_id = base + adjust
+  }
+  // Ensure active segment file exists and has a valid 16-byte header.
+  if store.seg_files[store.active_seg] is None {
+    let path = store.seg_path(store.active_seg)
+    let f : @fs.File? = Some(
+      open_or_create_segment(path, store.gen, truncate=true),
+    ) catch {
+      e => {
+        println("[monitor] cannot open " + path + ": " + e.to_string())
+        None
+      }
+    }
+    match f {
+      Some(file) => {
+        store.seg_files[store.active_seg] = Some(file)
+        store.seg_offsets[store.active_seg] = seg_header_size
+        store.seg_counts[store.active_seg] = 0
+      }
+      None => {
+        store.close_files()
+        println("[monitor] cannot use " + dir + ", falling back to memory")
+        return FlowStore::new(capacity~)
+      }
+    }
+  }
+  store
+}
+
+///|
+fn FlowStore::close_files(self : FlowStore) -> Unit {
+  for i = 0; i < 2; i = i + 1 {
+    match self.seg_files[i] {
+      Some(f) => {
+        f.close()
+        self.seg_files[i] = None
+      }
+      None => ()
     }
   }
 }
 
 ///|
-/// In-memory store (tests, and the fallback when the temp directory is not
-/// writable). Same schema and SQL as the file-backed store.
-pub fn FlowStore::new(capacity~ : Int32 = default_flow_capacity) -> FlowStore {
-  match open_store(":memory:", "", capacity, 0, 1) {
-    Some(store) => store
-    None => panic()
-  }
-}
-
-///|
-/// Close the underlying database (mainly for tests and orderly shutdown).
-pub fn FlowStore::close(self : FlowStore) -> Unit {
+/// Flush remaining flows and close underlying segment files.
+pub async fn FlowStore::close(self : FlowStore) -> Unit {
   self.flush_pending()
-  self.close_statements()
-  self.db.close()
+  self.close_files()
 }
 
 ///|
-/// Register a new flow (request fully read, response pending).
+/// Register a new flow (request fully read, response pending). Pure in-memory
+/// on the proxy hot path — zero disk I/O.
 pub fn FlowStore::begin(
   self : FlowStore,
   client_addr~ : String,
@@ -584,14 +1071,12 @@ pub fn FlowStore::begin(
   }
   self.next_id += self.id_stride
   self.total += 1
-  self.pending_total_delta += 1
-  // Hot path: no SQL here. The row is batched to SQLite by the flusher.
   self.active.push(flow)
   flow
 }
 
 ///|
-/// Mark a flow complete (idempotent) and queue it for batched persistence.
+/// Mark a flow complete (idempotent) and queue it for batched async append.
 pub fn FlowStore::finish(self : FlowStore, flow : Flow) -> Unit {
   if !self.recording || flow.finished {
     return
@@ -599,19 +1084,15 @@ pub fn FlowStore::finish(self : FlowStore, flow : Flow) -> Unit {
   flow.finished = true
   flow.end_ms = @env.now()
   if !self.take_active(flow.id) {
-    // Cleared or evicted while the request was still in flight.
+    // Cleared while the request was still in flight.
     return
   }
   if flow.injected {
     self.injected_total += 1
-    self.pending_injected_delta += 1
   }
-  // Hot path: queue for batched persistence; bodies stay in memory until the
-  // flusher writes them in a single transaction.
   self.pending.push(flow)
-  // Guard memory under extreme bursts: if pending grows past 2x capacity before
-  // the next flush tick, drop the oldest excess flows right away (they would be
-  // evicted immediately on flush anyway).
+  // Guard memory under extreme bursts: never retain more than 2x capacity in
+  // the un-flushed queue (older entries would be immediately evicted on flush).
   if self.capacity > 0 && self.pending.length() >= self.capacity * 2 {
     self.pending.sort_by((a, b) => a.id - b.id)
     let drop_n = self.pending.length() - self.capacity
@@ -630,135 +1111,73 @@ pub fn FlowStore::finish(self : FlowStore, flow : Flow) -> Unit {
 }
 
 ///|
-fn FlowStore::insert_flow_row(self : FlowStore, flow : Flow) -> Unit {
-  let values : Array[@moondb.Value] = [
-    @moondb.Int(flow.id),
-    @moondb.Int64(flow.start_ms.reinterpret_as_int64()),
-    @moondb.Text(flow.client_addr),
-    @moondb.Text(flow.http_method),
-    @moondb.Text(flow.target),
-    @moondb.Text(headers_to_text(flow.request_headers)),
-    @moondb.Blob(flow.request_body),
-    @moondb.Int(flow.request_size),
-    @moondb.Int(bool_int(flow.request_truncated)),
-    @moondb.Int(bool_int(flow.intercepted)),
-    @moondb.Text(flow.upstream),
-    @moondb.Int(bool_int(flow.injected)),
-    match flow.upstream_body {
-      Some(body) => @moondb.Blob(body)
-      None => @moondb.Null
-    },
-    @moondb.Int(bool_int(flow.upstream_truncated)),
-    @moondb.Int(flow.status),
-    @moondb.Text(flow.reason),
-    @moondb.Text(headers_to_text(flow.response_headers)),
-    @moondb.Blob(flow.response_body),
-    @moondb.Int(flow.response_size),
-    @moondb.Int(bool_int(flow.response_truncated)),
-    @moondb.Int64(flow.end_ms.reinterpret_as_int64()),
-    match flow.error {
-      Some(msg) => @moondb.Text(msg)
-      None => @moondb.Null
-    },
-    @moondb.Int(1),
-    @moondb.Text(content_type(flow.response_headers)),
-  ]
-  try {
-    match self.insert_stmt {
-      Some(stmt) => {
-        stmt.bind(values)
-        stmt.execute() |> ignore
-      }
-      None => self.db.execute(insert_flow_sql, values) |> ignore
+fn FlowStore::has_persisted_in_seg(self : FlowStore, seg : Int32) -> Bool {
+  for e in self.persisted {
+    if e.seg == seg {
+      return true
     }
-  } catch {
-    e =>
-      println(
-        "[monitor] cannot insert flow #" +
-        flow.id.to_string() +
-        ": " +
-        e.to_string(),
-      )
   }
+  false
 }
 
 ///|
-fn FlowStore::write_stat(self : FlowStore, key : String, value : Int32) -> Unit {
-  try {
-    match self.update_stat_stmt {
-      Some(stmt) => {
-        stmt.bind([@moondb.Int(value), @moondb.Text(key)])
-        stmt.execute() |> ignore
-      }
-      None =>
-        self.db.execute("UPDATE stats SET value = ? WHERE key = ?", [
-          @moondb.Int(value),
-          @moondb.Text(key),
-        ])
-        |> ignore
-    }
-  } catch {
-    e => println("[monitor] sqlite stat update failed: " + e.to_string())
-  }
-}
-
-///|
-fn FlowStore::add_stat(self : FlowStore, key : String, delta : Int32) -> Unit {
-  if delta == 0 {
+/// Rotate to the inactive segment when the active segment already holds at
+/// least `capacity` records and the inactive segment has no live entries.
+/// Truncating the inactive segment reclaims disk space with zero bytes copied.
+async fn FlowStore::maybe_rotate(self : FlowStore) -> Unit {
+  if self.dir.is_empty() || self.capacity <= 0 {
     return
   }
-  try {
-    match self.add_stat_stmt {
-      Some(stmt) => {
-        stmt.bind([@moondb.Int(delta), @moondb.Text(key)])
-        stmt.execute() |> ignore
-      }
-      None =>
-        self.db.execute("UPDATE stats SET value = value + ? WHERE key = ?", [
-          @moondb.Int(delta),
-          @moondb.Text(key),
-        ])
-        |> ignore
-    }
-  } catch {
-    e => println("[monitor] sqlite stat increment failed: " + e.to_string())
+  if self.seg_counts[self.active_seg] < self.capacity {
+    return
   }
-}
-
-///|
-fn FlowStore::delete_oldest_rows(self : FlowStore, count : Int32) -> Int32 {
-  if count <= 0 {
-    return 0
+  let other = 1 - self.active_seg
+  if self.has_persisted_in_seg(other) {
+    return
   }
-  try {
-    let res = match self.evict_stmt {
-      Some(stmt) => {
-        stmt.bind([@moondb.Int(count)])
-        stmt.execute()
-      }
-      None =>
-        self.db.execute(
-          "DELETE FROM flows WHERE id IN (SELECT id FROM flows ORDER BY id ASC LIMIT ?)",
-          [@moondb.Int(count)],
-        )
+  match self.seg_files[other] {
+    Some(f) => {
+      f.close()
+      self.seg_files[other] = None
     }
-    res.rows_affected.to_int()
-  } catch {
+    None => ()
+  }
+  let next_gen = self.gen + 1UL
+  let path = self.seg_path(other)
+  let new_file : @fs.File? = Some(
+    open_or_create_segment(path, next_gen, truncate=true),
+  ) catch {
     e => {
-      println("[monitor] sqlite evict failed: " + e.to_string())
-      0
+      println("[monitor] cannot rotate segment " + path + ": " + e.to_string())
+      None
     }
+  }
+  match new_file {
+    Some(f) => {
+      self.gen = next_gen
+      self.seg_files[other] = Some(f)
+      self.seg_offsets[other] = seg_header_size
+      self.seg_counts[other] = 0
+      self.active_seg = other
+    }
+    None => ()
   }
 }
 
 ///|
-/// Write all surviving finished flows, update stats, and evict beyond capacity
-/// in ONE single SQLite transaction (1 WAL commit, reusing prepared statements).
-/// Flows that would be immediately evicted are discarded before touching SQLite.
-pub fn FlowStore::flush_pending(self : FlowStore) -> Unit {
+/// Persist all surviving finished flows in ONE sequential async file append
+/// (executed off the event loop in `moonbitlang/async`'s C worker thread pool)
+/// and release their in-memory bodies.
+pub async fn FlowStore::flush_pending(self : FlowStore) -> Unit {
   if !self.recording || self.pending.length() == 0 {
     return
   }
+  self.flush_sem.acquire()
+  defer self.flush_sem.release()
+  if !self.recording || self.pending.length() == 0 {
+    return
+  }
+  let epoch = self.clear_epoch
   let batch = self.pending
   self.pending = []
   let keep = if self.capacity > 0 {
@@ -769,7 +1188,7 @@ pub fn FlowStore::flush_pending(self : FlowStore) -> Unit {
       0
     }
   } else {
-    self.db_count + batch.length()
+    self.persisted.length() + batch.length()
   }
   let mut skip = 0
   if self.capacity > 0 && batch.length() > keep {
@@ -784,104 +1203,129 @@ pub fn FlowStore::flush_pending(self : FlowStore) -> Unit {
       dropped.response_body = empty_bytes
     }
   }
-  let new_summaries : Array[@shared.FlowSummary] = Array(
-    capacity=batch.length() - skip,
-  )
-  let mut deleted_any = false
-  let began = try {
-    self.db.begin()
-    true
-  } catch {
-    e => {
-      println("[monitor] sqlite begin failed: " + e.to_string())
-      false
+  let to_write = batch.length() - skip
+  if to_write == 0 {
+    if self.capacity > 0 && self.persisted.length() > keep {
+      self.persisted.truncate(keep)
+    }
+    return
+  }
+  let total_snap = self.total
+  let inj_snap = self.injected_total
+  if self.dir.is_empty() {
+    // In-memory store (tests / fallback): encode into memory using the exact
+    // same binary format, then clear live Flow bodies.
+    for i = skip; i < batch.length(); i = i + 1 {
+      let flow = batch[i]
+      let payload = encode_flow_payload(flow, total_snap, inj_snap)
+      self.persisted.push({
+        id: flow.id,
+        seg: 0,
+        payload_offset: 0L,
+        payload_len: payload.length(),
+        summary: flow.summary(),
+        mem_payload: Some(payload),
+      })
+      flow.persisted = true
+      flow.request_body = empty_bytes
+      flow.upstream_body = None
+      flow.response_body = empty_bytes
+    }
+    self.persisted.sort_by((a, b) => b.id - a.id)
+    if self.capacity > 0 && self.persisted.length() > keep {
+      self.persisted.truncate(keep)
+    }
+    return
+  }
+  // Keep flows readable from memory while the async write runs off-thread.
+  self.flushing = batch
+  defer {
+    self.flushing = []
+  }
+  self.maybe_rotate()
+  if self.clear_epoch != epoch {
+    return
+  }
+  let seg = self.active_seg
+  let base_offset = self.seg_offsets[seg]
+  let mut est_bytes = 0
+  for i = skip; i < batch.length(); i = i + 1 {
+    let f = batch[i]
+    let up_len = match f.upstream_body {
+      Some(b) => b.length()
+      None => 0
+    }
+    est_bytes += 512 +
+      f.request_body.length() +
+      up_len +
+      f.response_body.length()
+  }
+  let write_buf = @buffer.Buffer(capacity=est_bytes)
+  let new_entries : Array[PersistedEntry] = Array(capacity=to_write)
+  let mut rel_off = 0L
+  for i = skip; i < batch.length(); i = i + 1 {
+    let flow = batch[i]
+    let plen = write_flow_frame_to(write_buf, flow, total_snap, inj_snap)
+    new_entries.push({
+      id: flow.id,
+      seg,
+      payload_offset: base_offset + rel_off + rec_header_size.to_int64(),
+      payload_len: plen,
+      summary: flow.summary(),
+      mem_payload: None,
+    })
+    rel_off += rec_header_size.to_int64() + plen.to_int64()
+  }
+  let bytes_to_write = write_buf.to_bytes()
+  let wrote = match self.seg_files[seg] {
+    Some(file) =>
+      try {
+        file.write_at(bytes_to_write[:], position=base_offset)
+        true
+      } catch {
+        e => {
+          println("[monitor] append write failed: " + e.to_string())
+          false
+        }
+      }
+    None => false
+  }
+  if self.clear_epoch != epoch {
+    return
+  }
+  if wrote {
+    self.seg_offsets[seg] = base_offset + bytes_to_write.length().to_int64()
+    self.seg_counts[seg] += to_write
+    for entry in new_entries {
+      self.persisted.push(entry)
+    }
+    self.persisted.sort_by((a, b) => b.id - a.id)
+    let keep_now = if self.capacity > 0 {
+      let k = self.capacity - self.active.length()
+      if k > 0 {
+        k
+      } else {
+        0
+      }
+    } else {
+      self.persisted.length()
+    }
+    if self.capacity > 0 && self.persisted.length() > keep_now {
+      self.persisted.truncate(keep_now)
     }
   }
   for i = skip; i < batch.length(); i = i + 1 {
     let flow = batch[i]
-    self.insert_flow_row(flow)
-    self.db_count += 1
-    if self.id_stride == 1 {
-      new_summaries.push(flow.summary())
-    }
-    flow.persisted = true
+    flow.persisted = wrote
     flow.request_body = empty_bytes
     flow.upstream_body = None
     flow.response_body = empty_bytes
   }
-  if self.id_stride > 1 {
-    let d_total = self.pending_total_delta
-    let d_inj = self.pending_injected_delta
-    self.pending_total_delta = 0
-    self.pending_injected_delta = 0
-    self.add_stat("total", d_total)
-    self.add_stat("injected_total", d_inj)
-    if self.capacity > 0 {
-      let total_rows = match self.rows("SELECT COUNT(*) FROM flows", []) {
-        [row] => row_int(row, 0)
-        _ => self.db_count
-      }
-      if total_rows > keep {
-        let removed = self.delete_oldest_rows(total_rows - keep)
-        self.db_count = total_rows - removed
-        deleted_any = removed > 0
-      } else {
-        self.db_count = total_rows
-      }
-    }
-  } else {
-    self.pending_total_delta = 0
-    self.pending_injected_delta = 0
-    self.write_stat("total", self.total)
-    self.write_stat("injected_total", self.injected_total)
-    if self.capacity > 0 && self.db_count > keep {
-      if keep == 0 {
-        self.exec("DELETE FROM flows") |> ignore
-        self.db_count = 0
-        self.summary_cache = []
-        deleted_any = true
-      } else {
-        let over = self.db_count - keep
-        let removed = self.delete_oldest_rows(over)
-        self.db_count = if self.db_count > removed {
-          self.db_count - removed
-        } else {
-          0
-        }
-        deleted_any = removed > 0
-      }
-    }
-  }
-  if began {
-    self.db.commit() catch {
-      e => println("[monitor] sqlite commit failed: " + e.to_string())
-    }
-  }
-  if self.id_stride == 1 {
-    if new_summaries.length() > 0 {
-      for s in new_summaries {
-        self.summary_cache.push(s)
-      }
-      self.summary_cache.sort_by((a, b) => b.id - a.id)
-    }
-    if self.capacity > 0 && self.summary_cache.length() > keep {
-      self.summary_cache.truncate(keep)
-    }
-  }
-  // Periodically reclaim free pages in incremental chunks so disk usage stays
-  // bounded without relocating pages on every flush.
-  if deleted_any && !self.dir.is_empty() {
-    self.flush_ticks += 1
-    if self.flush_ticks >= 32 {
-      self.flush_ticks = 0
-      self.exec("PRAGMA incremental_vacuum(64)") |> ignore
-    }
-  }
 }
 
 ///|
-/// Background flusher: batch-persist finished flows every ~50ms so the proxy
-/// hot path never waits on SQLite and tail-latency spikes stay small.
+/// Background flusher: batch-append finished flows off the event loop every
+/// ~100ms so the proxy hot path never blocks on disk I/O.
 pub async fn FlowStore::run_flusher(self : FlowStore) -> Unit {
   if !self.recording {
     return
@@ -911,72 +1355,82 @@ fn FlowStore::take_active(self : FlowStore, id : Int32) -> Bool {
 }
 
 ///|
-/// Keep only the newest `capacity` flows across memory (active+pending) and
-/// SQLite. In-flight (active) flows are never dropped; oldest pending then
-/// oldest persisted rows are evicted first.
-fn FlowStore::evict(self : FlowStore) -> Unit {
-  if !self.recording || self.capacity <= 0 {
-    return
-  }
-  let mut over = self.active.length() +
-    self.pending.length() +
-    self.db_count -
-    self.capacity
-  if over <= 0 {
-    return
-  }
-  if self.pending.length() > 0 {
-    let drop_p = if over < self.pending.length() {
-      over
-    } else {
-      self.pending.length()
-    }
-    if drop_p == self.pending.length() {
-      self.pending = []
-    } else {
-      let kept : Array[Flow] = Array(capacity=self.pending.length() - drop_p)
-      for i = drop_p; i < self.pending.length(); i = i + 1 {
-        kept.push(self.pending[i])
-      }
-      self.pending = kept
-    }
-    over -= drop_p
-  }
-  if over > 0 {
-    let removed = self.delete_oldest_rows(over)
-    self.db_count = if self.db_count > removed {
-      self.db_count - removed
-    } else {
-      0
-    }
-    let keep = self.capacity - self.active.length() - self.pending.length()
-    let keep = if keep > 0 { keep } else { 0 }
-    if self.summary_cache.length() > keep {
-      self.summary_cache.truncate(keep)
-    }
-  }
-}
-
-///|
-/// Clear the list, the database rows and the counters.
-pub fn FlowStore::clear(self : FlowStore) -> Unit {
+/// Clear the in-memory index, truncate/reset segment files, and zero counters.
+pub async fn FlowStore::clear(self : FlowStore) -> Unit {
+  self.clear_epoch += 1
   self.active = []
   self.pending = []
-  self.summary_cache = []
-  self.db_count = 0
+  self.flushing = []
+  self.persisted = []
   self.total = 0
   self.injected_total = 0
   self.next_id = 1
-  if !self.recording {
+  if !self.recording || self.dir.is_empty() {
     return
   }
-  self.exec("DELETE FROM flows") |> ignore
-  self.exec("UPDATE stats SET value = 0") |> ignore
-  self.exec("VACUUM") |> ignore
+  self.flush_sem.acquire()
+  defer self.flush_sem.release()
+  self.close_files()
+  if self.workers > 1 {
+    for w = 0; w < self.workers; w = w + 1 {
+      for seg = 0; seg < 2; seg = seg + 1 {
+        @fs.remove(
+          segment_path_for(self.dir, w, self.workers, seg),
+          allow_missing=true,
+        ) catch {
+          _ => ()
+        }
+      }
+    }
+  } else {
+    for seg = 0; seg < 2; seg = seg + 1 {
+      @fs.remove(self.seg_path(seg), allow_missing=true) catch {
+        _ => ()
+      }
+    }
+  }
+  self.active_seg = 0
+  self.gen = 1UL
+  self.seg_offsets = [seg_header_size, seg_header_size]
+  self.seg_counts = [0, 0]
+  let path = self.seg_path(0)
+  let f : @fs.File? = Some(
+    open_or_create_segment(path, self.gen, truncate=true),
+  ) catch {
+    e => {
+      println("[monitor] cannot reset segment " + path + ": " + e.to_string())
+      None
+    }
+  }
+  self.seg_files[0] = f
 }
 
 ///|
-pub fn FlowStore::find(self : FlowStore, id : Int32) -> Flow? {
+async fn FlowStore::read_entry_payload(
+  self : FlowStore,
+  entry : PersistedEntry,
+) -> Bytes? {
+  match entry.mem_payload {
+    Some(b) => Some(b)
+    None =>
+      match self.seg_files[entry.seg] {
+        Some(file) =>
+          Some(
+            file.read_exactly_at(
+              entry.payload_len,
+              position=entry.payload_offset,
+            ),
+          ) catch {
+            _ => None
+          }
+        None => None
+      }
+  }
+}
+
+///|
+/// Look up a flow by id (metadata only for persisted flows).
+pub async fn FlowStore::find(self : FlowStore, id : Int32) -> Flow? {
   if !self.recording {
     return None
   }
@@ -990,58 +1444,97 @@ pub fn FlowStore::find(self : FlowStore, id : Int32) -> Flow? {
       return Some(flow)
     }
   }
-  let rows = match self.find_stmt {
-    Some(stmt) =>
-      try {
-        stmt.bind([@moondb.Int(id)])
-        stmt.query()
-      } catch {
-        e => {
-          println("[monitor] sqlite find failed: " + e.to_string())
-          []
-        }
+  for flow in self.flushing {
+    if flow.id == id {
+      return Some(flow)
+    }
+  }
+  for entry in self.persisted {
+    if entry.id == id {
+      match self.read_entry_payload(entry) {
+        Some(payload) =>
+          if payload.length() >= 4 {
+            let meta_len = read_u32_le(payload, 0)
+            if meta_len >= 0 && 4 + meta_len <= payload.length() {
+              match decode_meta(payload, 4, 4 + meta_len) {
+                Some(meta) => return Some(meta.to_flow_without_bodies())
+                None => ()
+              }
+            }
+          }
+        None => ()
       }
-    None => self.rows(find_flow_sql, [@moondb.Int(id)])
+    }
   }
-  if rows.length() == 0 {
-    return None
-  }
-  let row = rows[0]
-  let start_ms = row_int64(row, 0).reinterpret_as_uint64()
-  let finished = row_int(row, 13) != 0
-  let error = if row_is_null(row, 12) { None } else { Some(row_text(row, 12)) }
-  Some({
-    id,
-    start_ms,
-    client_addr: row_text(row, 1),
-    http_method: row_text(row, 2),
-    target: row_text(row, 3),
-    request_headers: headers_from_text(row_text(row, 4)),
-    request_size: row_int(row, 5),
-    intercepted: row_int(row, 6) != 0,
-    upstream: row_text(row, 7),
-    request_body: empty_bytes,
-    request_truncated: row_int(row, 8) != 0,
-    injected: row_int(row, 9) != 0,
-    upstream_body: None,
-    upstream_truncated: row_int(row, 10) != 0,
-    status: row_int(row, 11),
-    reason: row_text(row, 14),
-    response_headers: headers_from_text(row_text(row, 15)),
-    response_body: empty_bytes,
-    response_size: row_int(row, 16),
-    response_truncated: row_int(row, 17) != 0,
-    end_ms: row_int64(row, 18).reinterpret_as_uint64(),
-    error,
-    finished,
-    persisted: finished,
-  })
+  None
 }
 
 ///|
-/// Full detail of one flow: from memory while it is in flight, from SQLite
-/// once it has been persisted.
-pub fn FlowStore::detail(self : FlowStore, id : Int32) -> @shared.FlowDetail? {
+/// Scan sibling workers' segment files in multi-worker mode to locate one flow
+/// detail by id.
+async fn FlowStore::detail_from_peer_workers(
+  self : FlowStore,
+  id : Int32,
+) -> @shared.FlowDetail? {
+  if self.workers <= 1 || self.dir.is_empty() {
+    return None
+  }
+  for w = 0; w < self.workers; w = w + 1 {
+    if w == self.worker_id {
+      continue
+    }
+    for seg = 0; seg < 2; seg = seg + 1 {
+      let path = segment_path_for(self.dir, w, self.workers, seg)
+      if !@fs.exists(path) {
+        continue
+      }
+      let opened : @fs.File? = Some(
+        @fs.open(path, mode=ReadOnly, create_mode=OpenExisting),
+      ) catch {
+        _ => None
+      }
+      match opened {
+        Some(file) => {
+          defer file.close()
+          match scan_segment_file(file, seg) {
+            Some((_, _, _, entries, _, _)) =>
+              for e in entries {
+                if e.id == id {
+                  let payload : Bytes? = Some(
+                    file.read_exactly_at(
+                      e.payload_len,
+                      position=e.payload_offset,
+                    ),
+                  ) catch {
+                    _ => None
+                  }
+                  match payload {
+                    Some(p) =>
+                      match decode_flow_detail(p) {
+                        Some(d) => return Some(d)
+                        None => ()
+                      }
+                    None => ()
+                  }
+                }
+              }
+            None => ()
+          }
+        }
+        None => ()
+      }
+    }
+  }
+  None
+}
+
+///|
+/// Full detail of one flow: served from memory while in flight / pending, or
+/// via a single async `pread` (`File::read_exactly_at`) once persisted.
+pub async fn FlowStore::detail(
+  self : FlowStore,
+  id : Int32,
+) -> @shared.FlowDetail? {
   if !self.recording {
     return None
   }
@@ -1055,157 +1548,102 @@ pub fn FlowStore::detail(self : FlowStore, id : Int32) -> @shared.FlowDetail? {
       return Some(flow.detail())
     }
   }
-  let rows = match self.detail_stmt {
-    Some(stmt) =>
-      try {
-        stmt.bind([@moondb.Int(id)])
-        stmt.query()
-      } catch {
-        e => {
-          println("[monitor] sqlite detail failed: " + e.to_string())
-          []
-        }
+  for flow in self.flushing {
+    if flow.id == id {
+      return Some(flow.detail())
+    }
+  }
+  for entry in self.persisted {
+    if entry.id == id {
+      match self.read_entry_payload(entry) {
+        Some(payload) => return decode_flow_detail(payload)
+        None => return None
       }
-    None => self.rows(detail_flow_sql, [@moondb.Int(id)])
+    }
   }
-  if rows.length() == 0 {
-    return None
-  }
-  let row = rows[0]
-  let start_ms = row_int64(row, 0).reinterpret_as_uint64()
-  let end_ms = row_int64(row, 19).reinterpret_as_uint64()
-  let finished = row_int(row, 21) != 0
-  let error = if row_is_null(row, 20) { None } else { Some(row_text(row, 20)) }
-  let status = row_int(row, 13)
-  let reason = row_text(row, 14)
-  let response_headers = headers_from_text(row_text(row, 15))
-  let request : @shared.RequestData = {
-    http_method: row_text(row, 2),
-    target: row_text(row, 3),
-    headers: headers_from_text(row_text(row, 4)),
-    body: @utf8.decode_lossy(row_blob(row, 5)),
-    truncated: row_int(row, 6) != 0,
-    size: row_int(row, 7),
-  }
-  let upstream_request : @shared.UpstreamRequest? = if row_is_null(row, 11) {
-    None
-  } else {
-    Some({
-      body: @utf8.decode_lossy(row_blob(row, 11)),
-      truncated: row_int(row, 12) != 0,
-    })
-  }
-  let response : @shared.ResponseData? = if status == 0 && error is None {
-    None
-  } else {
-    Some({
-      status,
-      reason,
-      headers: response_headers,
-      body: @utf8.decode_lossy(row_blob(row, 16)),
-      truncated: row_int(row, 18) != 0,
-      size: row_int(row, 17),
-    })
-  }
-  Some({
-    id,
-    start_ms: start_ms.to_double(),
-    duration_ms: duration_between(start_ms, end_ms),
-    client_addr: row_text(row, 1),
-    upstream: row_text(row, 9),
-    intercepted: row_int(row, 8) != 0,
-    injected: row_int(row, 10) != 0,
-    pending: !finished,
-    error,
-    request,
-    upstream_request,
-    response,
-  })
+  self.detail_from_peer_workers(id)
 }
 
 ///|
 /// Flow list API payload (newest first, shared contract type). In single-worker
-/// mode this is served entirely from the in-memory summary cache + active/pending
-/// queues (zero SQLite I/O); in multi-worker mode it reads the shared WAL DB so
-/// the UI displays flows from all workers.
-pub fn FlowStore::list_response(self : FlowStore) -> @shared.FlowsResponse {
-  if self.id_stride > 1 && self.recording {
-    self.load_summary_cache()
-    self.total = self.read_stat("total") + self.pending_total_delta
-    self.injected_total = self.read_stat("injected_total") +
-      self.pending_injected_delta
-  }
+/// mode this is served 100% from memory (zero disk I/O); in multi-worker mode
+/// it merges metadata headers from sibling workers' logs.
+pub async fn FlowStore::list_response(
+  self : FlowStore,
+) -> @shared.FlowsResponse {
   let flows : Array[@shared.FlowSummary] = Array(
-    capacity=self.summary_cache.length() +
+    capacity=self.persisted.length() +
+      self.flushing.length() +
       self.pending.length() +
       self.active.length(),
   )
-  for s in self.summary_cache {
-    flows.push(s)
+  for entry in self.persisted {
+    flows.push(entry.summary)
   }
-  // Include not-yet-persisted (pending) and in-flight (active) flows so the
-  // list is complete even between flusher ticks.
+  for flow in self.flushing {
+    flows.push(flow.summary())
+  }
   for flow in self.pending {
     flows.push(flow.summary())
   }
   for flow in self.active {
     flows.push(flow.summary())
+  }
+  let mut total = self.total
+  let mut injected_total = self.injected_total
+  if self.workers > 1 && self.recording && !self.dir.is_empty() {
+    for w = 0; w < self.workers; w = w + 1 {
+      if w == self.worker_id {
+        continue
+      }
+      let mut w_tot = 0
+      let mut w_inj = 0
+      for seg = 0; seg < 2; seg = seg + 1 {
+        let path = segment_path_for(self.dir, w, self.workers, seg)
+        if !@fs.exists(path) {
+          continue
+        }
+        let opened : @fs.File? = Some(
+          @fs.open(path, mode=ReadOnly, create_mode=OpenExisting),
+        ) catch {
+          _ => None
+        }
+        match opened {
+          Some(file) => {
+            defer file.close()
+            match scan_segment_file(file, seg) {
+              Some((_, _, _, entries, tot, inj)) => {
+                if tot > w_tot {
+                  w_tot = tot
+                }
+                if inj > w_inj {
+                  w_inj = inj
+                }
+                for e in entries {
+                  flows.push(e.summary)
+                }
+              }
+              None => ()
+            }
+          }
+          None => ()
+        }
+      }
+      total += w_tot
+      injected_total += w_inj
+    }
   }
   flows.sort_by((a, b) => b.id - a.id)
   if self.capacity > 0 && flows.length() > self.capacity {
     flows.truncate(self.capacity)
   }
   {
-    total: self.total,
-    injected_total: self.injected_total,
+    total,
+    injected_total,
     stored: flows.length(),
     capacity: self.capacity,
     intercept_enabled: self.intercept_enabled,
     flows,
-  }
-}
-
-///|
-fn row_int(row : @moondb.Row, index : Int32) -> Int32 {
-  row.int(index) catch {
-    _ => 0
-  }
-}
-
-///|
-fn row_int64(row : @moondb.Row, index : Int32) -> Int64 {
-  row.int64(index) catch {
-    _ => 0L
-  }
-}
-
-///|
-fn row_text(row : @moondb.Row, index : Int32) -> String {
-  row.text(index) catch {
-    _ => ""
-  }
-}
-
-///|
-fn row_blob(row : @moondb.Row, index : Int32) -> Bytes {
-  row.blob(index) catch {
-    _ => empty_bytes
-  }
-}
-
-///|
-fn row_is_null(row : @moondb.Row, index : Int32) -> Bool {
-  row.is_null(index) catch {
-    _ => true
-  }
-}
-
-///|
-fn bool_int(value : Bool) -> Int32 {
-  if value {
-    1
-  } else {
-    0
   }
 }
 
@@ -1217,64 +1655,6 @@ fn duration_between(start_ms : UInt64, end_ms : UInt64) -> Int32 {
     (end_ms - start_ms).to_int()
   }
 }
-
-///|
-/// Serialize headers as `name: value\n` lines (HTTP header values cannot
-/// contain newlines, so this round-trips safely).
-fn headers_to_text(headers : Array[(String, String)]) -> String {
-  if headers.is_empty() {
-    return ""
-  }
-  let sb = StringBuilder(capacity=256)
-  for pair in headers {
-    sb.write_string(pair.0)
-    sb.write_string(": ")
-    sb.write_string(pair.1)
-    sb.write_char('\n')
-  }
-  sb.to_string()
-}
-
-///|
-fn headers_from_text(text : String) -> Array[(String, String)] {
-  let out : Array[(String, String)] = []
-  for line in text.clamped_view().split("\n") {
-    if !line.is_empty() {
-      match line.split_once(": ") {
-        Some((name, value)) => out.push((name.to_owned(), value.to_owned()))
-        None => ()
-      }
-    }
-  }
-  out
-}
-
-///|
-/// Insert statement used by `FlowStore::begin` (24 bound columns).
-let insert_flow_sql : String = "INSERT INTO flows (" +
-  "id, start_ms, client_addr, method, target, request_headers, " +
-  "request_body, request_size, request_truncated, intercepted, upstream, " +
-  "injected, upstream_body, upstream_truncated, status, reason, " +
-  "response_headers, response_body, response_size, response_truncated, " +
-  "end_ms, error, finished, content_type" +
-  ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
-
-///|
-/// Full projection used by `FlowStore::detail`.
-let detail_flow_sql : String = "SELECT " +
-  "start_ms, client_addr, method, target, request_headers, request_body, " +
-  "request_truncated, request_size, intercepted, upstream, injected, " +
-  "upstream_body, upstream_truncated, status, reason, response_headers, " +
-  "response_body, response_size, response_truncated, end_ms, error, " +
-  "finished, content_type FROM flows WHERE id = ?"
-
-///|
-/// Metadata projection used by `FlowStore::find`.
-let find_flow_sql : String = "SELECT " +
-  "start_ms, client_addr, method, target, request_headers, request_size, " +
-  "request_truncated, intercepted, upstream, injected, upstream_truncated, " +
-  "status, error, finished, reason, response_headers, response_size, " +
-  "response_truncated, end_ms FROM flows WHERE id = ?"
 
 ///|
 /// Store at most `body_capture_limit` bytes of a body.

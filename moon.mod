@@ -32,6 +32,4 @@ import {
   "moonbit-community/rabbita@0.17.0",
   "spectacleCase/dotenv@0.1.0",
   "moonbitlang/moonback@0.8.11",
-  "moonbitstack/moonsqlite@0.4.1",
-  "moonbitstack/moondb@0.3.1",
 }
