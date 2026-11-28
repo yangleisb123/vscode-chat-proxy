@@ -448,30 +448,30 @@ pub fn write_upstream_head_keepalive(
   send_content_length : Bool,
 ) -> Unit {
   buf.write_string_utf8(head.http_method)
-  buf.write_bytes(b" ")
+  buf.write_bytesview(b" ")
   buf.write_string_utf8(head.target)
-  buf.write_bytes(b" HTTP/1.1\r\nHost: ")
+  buf.write_bytesview(b" HTTP/1.1\r\nHost: ")
   buf.write_string_utf8(upstream_host)
   if upstream_port != 80 {
     buf.write_byte(b':')
     buf.write_string_utf8(upstream_port.to_string())
   }
-  buf.write_bytes(b"\r\n")
+  buf.write_bytesview(b"\r\n")
   for pair in head.headers {
     if is_managed_or_hop_by_hop(pair.0.clamped_view()) {
       continue
     }
     buf.write_string_utf8(pair.0)
-    buf.write_bytes(b": ")
+    buf.write_bytesview(b": ")
     buf.write_string_utf8(pair.1)
-    buf.write_bytes(b"\r\n")
+    buf.write_bytesview(b"\r\n")
   }
   if send_content_length {
-    buf.write_bytes(b"Content-Length: ")
+    buf.write_bytesview(b"Content-Length: ")
     buf.write_string_utf8(body_len.to_string())
-    buf.write_bytes(b"\r\n")
+    buf.write_bytesview(b"\r\n")
   }
-  buf.write_bytes(b"Connection: keep-alive\r\n\r\n")
+  buf.write_bytesview(b"Connection: keep-alive\r\n\r\n")
 }
 
 ///|

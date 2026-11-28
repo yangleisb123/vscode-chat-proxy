@@ -1,6 +1,6 @@
 ///|
 #cfg(platform="windows")
-async fn supports_reuse_port_workers() -> Bool {
+fn supports_reuse_port_workers() -> Bool {
   false
 }
 

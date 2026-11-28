@@ -295,7 +295,7 @@ fn FlowStore::seg_path(self : FlowStore, seg : Int32) -> String {
 ///|
 fn make_segment_header(gen : UInt64) -> Bytes {
   let buf = @buffer.Buffer(capacity=16)
-  buf.write_bytes(b"VCP1")
+  buf.write_bytesview(b"VCP1")
   buf.write_int_le(1)
   buf.write_uint64_le(gen)
   buf.to_bytes()
@@ -331,7 +331,7 @@ fn write_lp_string(buf : @buffer.Buffer, s : String) -> Unit {
   let utf8 = @utf8.encode(s)
   buf.write_int_le(utf8.length())
   if utf8.length() > 0 {
-    buf.write_bytes(utf8[:])
+    buf.write_bytesview(utf8[:])
   }
 }
 
@@ -339,7 +339,7 @@ fn write_lp_string(buf : @buffer.Buffer, s : String) -> Unit {
 fn write_lp_bytes(buf : @buffer.Buffer, data : Bytes) -> Unit {
   buf.write_int_le(data.length())
   if data.length() > 0 {
-    buf.write_bytes(data[:])
+    buf.write_bytesview(data[:])
   }
 }
 
@@ -435,10 +435,10 @@ fn write_flow_frame_to(
     up_len +
     4 +
     flow.response_body.length()
-  out.write_bytes(b"FLW1")
+  out.write_bytesview(b"FLW1")
   out.write_int_le(payload_len)
   out.write_int_le(meta_bytes.length())
-  out.write_bytes(meta_bytes[:])
+  out.write_bytesview(meta_bytes[:])
   write_lp_bytes(out, flow.request_body)
   match flow.upstream_body {
     Some(b) => write_lp_bytes(out, b)
@@ -470,7 +470,7 @@ fn encode_flow_payload(
     flow.response_body.length()
   let out = @buffer.Buffer(capacity=total_payload_len)
   out.write_int_le(meta_bytes.length())
-  out.write_bytes(meta_bytes[:])
+  out.write_bytesview(meta_bytes[:])
   write_lp_bytes(out, flow.request_body)
   match flow.upstream_body {
     Some(b) => write_lp_bytes(out, b)
@@ -1783,10 +1783,12 @@ pub fn decode_chunked_body(raw : Bytes) -> Bytes {
         let data_start = line_end + 2
         if data_start + size > v.length() {
           // Truncated capture: keep whatever is available.
-          out.write_bytes(v.clamped_view(start=data_start))
+          out.write_bytesview(v.clamped_view(start=data_start))
           break
         }
-        out.write_bytes(v.clamped_view(start=data_start, end=data_start + size))
+        out.write_bytesview(
+          v.clamped_view(start=data_start, end=data_start + size),
+        )
         pos = data_start + size + 2
       }
     }

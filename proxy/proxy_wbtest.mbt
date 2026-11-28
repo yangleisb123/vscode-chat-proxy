@@ -101,7 +101,7 @@ async fn relay_chunked(
   let buf = @buffer.Buffer()
   for ;; {
     match client_peer.read_some(max_len=65536) {
-      Some(chunk) => buf.write_bytes(chunk.clamped_view())
+      Some(chunk) => buf.write_bytesview(chunk.clamped_view())
       None => break
     }
   }

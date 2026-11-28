@@ -45,7 +45,7 @@ fn BodyCapture::add_view(self : BodyCapture, chunk : BytesView) -> Unit {
   if self.buf.length() < @monitor.body_capture_limit {
     let room = @monitor.body_capture_limit - self.buf.length()
     let take = if clen < room { clen } else { room }
-    self.buf.write_bytes(chunk[:take])
+    self.buf.write_bytesview(chunk[:take])
   }
 }
 
@@ -299,7 +299,7 @@ async fn handle_connection_inner(
       send_cl,
     )
     if combine_body {
-      req_buf.write_bytes(out_body[:])
+      req_buf.write_bytesview(out_body[:])
     }
     let req_first = req_buf.to_bytes()
     let req_rest = if combine_body { empty_bytes } else { out_body }
@@ -408,21 +408,21 @@ fn write_response_head(
   keep_client : Bool,
 ) -> Unit {
   buf.write_string_utf8(status_line)
-  buf.write_bytes(b"\r\n")
+  buf.write_bytesview(b"\r\n")
   for pair in resp_headers {
     let n = pair.0.clamped_view()
     if n.length() == 10 && n.equal_ignore_ascii_case("connection") {
       continue
     }
     buf.write_string_utf8(pair.0)
-    buf.write_bytes(b": ")
+    buf.write_bytesview(b": ")
     buf.write_string_utf8(pair.1)
-    buf.write_bytes(b"\r\n")
+    buf.write_bytesview(b"\r\n")
   }
   if keep_client {
-    buf.write_bytes(b"Connection: keep-alive\r\n\r\n")
+    buf.write_bytesview(b"Connection: keep-alive\r\n\r\n")
   } else {
-    buf.write_bytes(b"Connection: close\r\n\r\n")
+    buf.write_bytesview(b"Connection: close\r\n\r\n")
   }
 }
 
@@ -502,19 +502,19 @@ async fn forward_response_head_and_body(
       if size == 0 {
         chunk_buf.reset()
         chunk_buf.write_string_utf8(size_line)
-        chunk_buf.write_bytes(b"\r\n")
+        chunk_buf.write_bytesview(b"\r\n")
         for ;; {
           match conn.read_until("\r\n") {
             Some("") => {
               // The empty line after the last chunk (and any trailers)
               // terminates the chunked message: relay it in the same write.
-              chunk_buf.write_bytes(b"\r\n")
+              chunk_buf.write_bytesview(b"\r\n")
               break
             }
             None => break
             Some(t) => {
               chunk_buf.write_string_utf8(t)
-              chunk_buf.write_bytes(b"\r\n")
+              chunk_buf.write_bytesview(b"\r\n")
             }
           }
         }
@@ -525,9 +525,9 @@ async fn forward_response_head_and_body(
       let _ = conn.drop(2)
       chunk_buf.reset()
       chunk_buf.write_string_utf8(size_line)
-      chunk_buf.write_bytes(b"\r\n")
-      chunk_buf.write_bytes(data[:])
-      chunk_buf.write_bytes(b"\r\n")
+      chunk_buf.write_bytesview(b"\r\n")
+      chunk_buf.write_bytesview(data[:])
+      chunk_buf.write_bytesview(b"\r\n")
       client.write(chunk_buf.to_bytes())
       if recording {
         cap.add_view(data[:])
@@ -553,7 +553,7 @@ async fn forward_response_head_and_body(
       let data = conn.read_exactly(n)
       let out_buf = @buffer.Buffer(capacity=512 + n)
       write_response_head(out_buf, status_line, resp_headers, keep_client)
-      out_buf.write_bytes(data[:])
+      out_buf.write_bytesview(data[:])
       client.write(out_buf.to_bytes())
       if recording {
         flow.response_body = data
@@ -777,7 +777,7 @@ async fn read_request_body(
         }
         break
       }
-      buf.write_bytes(client.read_exactly(size)[:])
+      buf.write_bytesview(client.read_exactly(size)[:])
       let _ = client.drop(2)
     }
     return buf.to_bytes()
@@ -809,15 +809,15 @@ async fn send_simple(
 ) -> Unit {
   let body = "proxy error: " + reason + "\n"
   let buf = @buffer.Buffer(capacity=192)
-  buf.write_bytes(b"HTTP/1.1 ")
+  buf.write_bytesview(b"HTTP/1.1 ")
   buf.write_string_utf8(code.to_string())
   buf.write_byte(b' ')
   buf.write_string_utf8(reason)
-  buf.write_bytes(
+  buf.write_bytesview(
     b"\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: ",
   )
   buf.write_string_utf8(body.length().to_string())
-  buf.write_bytes(b"\r\nConnection: close\r\n\r\n")
+  buf.write_bytesview(b"\r\nConnection: close\r\n\r\n")
   buf.write_string_utf8(body)
   client.write(buf.to_bytes())
 }
