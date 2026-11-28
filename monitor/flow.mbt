@@ -336,11 +336,19 @@ fn write_lp_string(buf : @buffer.Buffer, s : String) -> Unit {
 }
 
 ///|
-fn write_lp_bytes(buf : @buffer.Buffer, data : Bytes) -> Unit {
-  buf.write_int_le(data.length())
-  if data.length() > 0 {
-    buf.write_bytesview(data[:])
-  }
+fn write_u32_le(out : FixedArray[Byte], pos : Int32, value : Int32) -> Unit {
+  out[pos] = value.to_byte()
+  out[pos + 1] = (value >> 8).to_byte()
+  out[pos + 2] = (value >> 16).to_byte()
+  out[pos + 3] = (value >> 24).to_byte()
+}
+
+///|
+fn write_lp_bytes(out : FixedArray[Byte], pos : Int32, data : Bytes) -> Int32 {
+  let len = data.length()
+  write_u32_le(out, pos, len)
+  out.blit_from_bytes(pos + 4, data, 0, len)
+  pos + 4 + len
 }
 
 ///|
@@ -413,39 +421,26 @@ fn encode_flow_meta(
 }
 
 ///|
-/// Write one complete framed record (`FLW1` + `payload_len` + payload) directly
-/// into `out`, avoiding any intermediate copy of large request/response bodies.
-/// Returns `payload_len`.
-fn write_flow_frame_to(
-  out : @buffer.Buffer,
+fn flow_payload_length(flow : Flow, meta : Bytes) -> Int32 {
+  // Four little-endian lengths, followed by metadata and the three body blobs.
+  16 +
+  meta.length() +
+  flow.request_body.length() +
+  flow.upstream_body.unwrap_or(empty_bytes).length() +
+  flow.response_body.length()
+}
+
+///|
+fn write_flow_payload(
+  out : FixedArray[Byte],
+  pos : Int32,
   flow : Flow,
-  total_snap : Int32,
-  injected_snap : Int32,
-) -> Int32 {
-  let meta_bytes = encode_flow_meta(flow, total_snap, injected_snap)
-  let up_len = match flow.upstream_body {
-    Some(b) => b.length()
-    None => 0
-  }
-  let payload_len = 4 +
-    meta_bytes.length() +
-    4 +
-    flow.request_body.length() +
-    4 +
-    up_len +
-    4 +
-    flow.response_body.length()
-  out.write_bytesview(b"FLW1")
-  out.write_int_le(payload_len)
-  out.write_int_le(meta_bytes.length())
-  out.write_bytesview(meta_bytes[:])
-  write_lp_bytes(out, flow.request_body)
-  match flow.upstream_body {
-    Some(b) => write_lp_bytes(out, b)
-    None => out.write_int_le(0)
-  }
-  write_lp_bytes(out, flow.response_body)
-  payload_len
+  meta : Bytes,
+) -> Unit {
+  let pos = write_lp_bytes(out, pos, meta)
+  let pos = write_lp_bytes(out, pos, flow.request_body)
+  let pos = write_lp_bytes(out, pos, flow.upstream_body.unwrap_or(empty_bytes))
+  ignore(write_lp_bytes(out, pos, flow.response_body))
 }
 
 ///|
@@ -455,29 +450,10 @@ fn encode_flow_payload(
   total_snap : Int32,
   injected_snap : Int32,
 ) -> Bytes {
-  let meta_bytes = encode_flow_meta(flow, total_snap, injected_snap)
-  let up_len = match flow.upstream_body {
-    Some(b) => b.length()
-    None => 0
-  }
-  let total_payload_len = 4 +
-    meta_bytes.length() +
-    4 +
-    flow.request_body.length() +
-    4 +
-    up_len +
-    4 +
-    flow.response_body.length()
-  let out = @buffer.Buffer(capacity=total_payload_len)
-  out.write_int_le(meta_bytes.length())
-  out.write_bytesview(meta_bytes[:])
-  write_lp_bytes(out, flow.request_body)
-  match flow.upstream_body {
-    Some(b) => write_lp_bytes(out, b)
-    None => out.write_int_le(0)
-  }
-  write_lp_bytes(out, flow.response_body)
-  out.to_bytes()
+  let meta = encode_flow_meta(flow, total_snap, injected_snap)
+  let out = FixedArray::make(flow_payload_length(flow, meta), b'\x00')
+  write_flow_payload(out, 0, flow, meta)
+  out.unsafe_reinterpret_as_bytes()
 }
 
 ///|
@@ -1248,35 +1224,38 @@ pub async fn FlowStore::flush_pending(self : FlowStore) -> Unit {
   }
   let seg = self.active_seg
   let base_offset = self.seg_offsets[seg]
-  let mut est_bytes = 0
-  for i = skip; i < batch.length(); i = i + 1 {
-    let f = batch[i]
-    let up_len = match f.upstream_body {
-      Some(b) => b.length()
-      None => 0
-    }
-    est_bytes += 512 +
-      f.request_body.length() +
-      up_len +
-      f.response_body.length()
-  }
-  let write_buf = @buffer.Buffer(capacity=est_bytes)
-  let new_entries : Array[PersistedEntry] = Array(capacity=to_write)
-  let mut rel_off = 0L
+  // Compute the exact batch size from metadata encoded once per flow.
+  let metadata : Array[Bytes] = Array(capacity=to_write)
+  let mut batch_size = 0
   for i = skip; i < batch.length(); i = i + 1 {
     let flow = batch[i]
-    let plen = write_flow_frame_to(write_buf, flow, total_snap, inj_snap)
+    let meta = encode_flow_meta(flow, total_snap, inj_snap)
+    metadata.push(meta)
+    batch_size += rec_header_size + flow_payload_length(flow, meta)
+  }
+  let write_buf = FixedArray::make(batch_size, b'\x00')
+  let new_entries : Array[PersistedEntry] = Array(capacity=to_write)
+  let mut rel_off = 0
+  for i = skip; i < batch.length(); i = i + 1 {
+    let flow = batch[i]
+    let meta = metadata[i - skip]
+    let plen = flow_payload_length(flow, meta)
+    let payload_pos = rel_off + rec_header_size
+    write_buf.blit_from_bytes(rel_off, b"FLW1", 0, 4)
+    write_u32_le(write_buf, rel_off + 4, plen)
+    write_flow_payload(write_buf, payload_pos, flow, meta)
     new_entries.push({
       id: flow.id,
       seg,
-      payload_offset: base_offset + rel_off + rec_header_size.to_int64(),
+      payload_offset: base_offset + payload_pos.to_int64(),
       payload_len: plen,
       summary: flow.summary(),
       mem_payload: None,
     })
-    rel_off += rec_header_size.to_int64() + plen.to_int64()
+    rel_off = payload_pos + plen
   }
-  let bytes_to_write = write_buf.to_bytes()
+  // The batch is complete and its backing array is no longer mutated.
+  let bytes_to_write = write_buf.unsafe_reinterpret_as_bytes()
   let wrote = match self.seg_files[seg] {
     Some(file) =>
       try {

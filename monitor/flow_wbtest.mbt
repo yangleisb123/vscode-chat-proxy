@@ -191,6 +191,45 @@ async test "flow: append-log persists to temp dir, reloads, rotates, recovers tr
 }
 
 ///|
+async test "flow: reads each large record at its own offset after a shared flush" {
+  let dir = @fs.tmpdir(prefix="vscode-chat-proxy-batch-test")
+  let store = FlowStore::open(dir)
+  let body = String::make(65536, 'x')
+  let first = store.begin(
+    client_addr="127.0.0.1:1",
+    http_method="POST",
+    target="/large",
+    request_headers=[("X-Batch-Test", String::make(1024, 'h'))],
+    request_body=@utf8.encode(body),
+    intercepted=true,
+    upstream="u:80",
+  )
+  first.injected = true
+  let rewritten = "prefix\n" + body
+  first.upstream_body = Some(@utf8.encode(rewritten))
+  first.status = 200
+  first.response_body = b"first response"
+  let second = begin_test_flow(store, "/second")
+  second.status = 200
+  second.response_body = b"second response"
+  store.finish(first)
+  store.finish(second)
+  store.flush_pending()
+  store.close()
+
+  let reopened = FlowStore::open(dir)
+  let first_detail = reopened.detail(first.id).unwrap()
+  assert_eq(first_detail.request.body, body)
+  assert_eq(first_detail.upstream_request.unwrap().body, rewritten)
+  assert_eq(first_detail.response.unwrap().body, "first response")
+  let second_detail = reopened.detail(second.id).unwrap()
+  assert_true(second_detail.upstream_request is None)
+  assert_eq(second_detail.response.unwrap().body, "second response")
+  reopened.close()
+  @fs.rmdir(dir, recursive=true, allow_missing=true)
+}
+
+///|
 async test "monitor: intercept switch defaults on and toggles at runtime" {
   let store = FlowStore::new()
   assert_true(store.intercept_enabled())
